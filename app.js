@@ -1,0 +1,3737 @@
+// 放空 - 网页版应用主逻辑（支持 WebDAV 同步）
+
+// ==================== WebDAV 客户端 ====================
+class WebDAVClient {
+  constructor(config) {
+    this.baseUrl = config.url.replace(/\/$/, '');
+    this.username = config.username;
+    this.password = config.password;
+    this.path = config.path.startsWith('/') ? config.path : '/' + config.path;
+  }
+
+  // 获取完整 URL
+  getFullUrl(path) {
+    // 智能拼接路径，避免双斜杠
+    let base = this.baseUrl;
+    let prefix = this.path;
+
+    if (!base.endsWith('/')) base += '/';
+    if (prefix.startsWith('/')) prefix = prefix.slice(1);
+    if (prefix && !prefix.endsWith('/')) prefix += '/';
+
+    let finalPath = path;
+    if (finalPath.startsWith('/')) finalPath = finalPath.slice(1);
+
+    return base + prefix + finalPath;
+  }
+
+  // 基本请求
+  async request(method, path, options = {}) {
+    const url = this.getFullUrl(path);
+    const headers = {
+      'Authorization': 'Basic ' + btoa(this.username + ':' + this.password),
+      ...options.headers
+    };
+
+    try {
+      const response = await fetch(url, {
+        method,
+        headers,
+        ...options
+      });
+
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+      }
+
+      return response;
+    } catch (error) {
+      console.error('WebDAV request failed:', error);
+      throw error;
+    }
+  }
+
+  // 测试连接
+  async test() {
+    try {
+      // 尝试创建目录（如果不存在）
+      await this.createDirectory('');
+      return { success: true };
+    } catch (error) {
+      return { success: false, error: error.message };
+    }
+  }
+
+  // 创建目录
+  async createDirectory(path) {
+    try {
+      await this.request('MKCOL', path);
+    } catch (error) {
+      // 409 表示目录已存在
+      if (!error.message.includes('409')) {
+        throw error;
+      }
+    }
+  }
+
+  // 上传文件
+  async upload(path, content) {
+    await this.request('PUT', path, {
+      headers: { 'Content-Type': 'application/json' },
+      body: typeof content === 'string' ? content : JSON.stringify(content)
+    });
+  }
+
+  // 下载文件
+  async download(path) {
+    try {
+      const response = await this.request('GET', path);
+      const text = await response.text();
+      return JSON.parse(text);
+    } catch (error) {
+      if (error.message.includes('404')) {
+        return null;
+      }
+      throw error;
+    }
+  }
+
+  // 下载原始文本
+  async downloadText(path) {
+    try {
+      const response = await this.request('GET', path);
+      return await response.text();
+    } catch (error) {
+      if (error.message.includes('404')) {
+        return null;
+      }
+      throw error;
+    }
+  }
+
+  // 删除文件
+  async delete(path) {
+    try {
+      const response = await this.request('DELETE', path);
+      return response.status >= 200 && response.status < 300;
+    } catch (error) {
+      if (error.message.includes('404')) {
+        return true;
+      }
+      return false;
+    }
+  }
+
+  // 列出目录内容
+  async listDir(path) {
+    try {
+      const response = await this.request('PROPFIND', path, {
+        headers: {
+          'Content-Type': 'text/xml; charset=utf-8',
+          'Depth': '1'
+        },
+        body: `<?xml version="1.0" encoding="utf-8"?>
+          <propfind xmlns="DAV:">
+            <prop>
+              <displayname/>
+              <getlastmodified/>
+            </prop>
+          </propfind>`
+      });
+
+      const text = await response.text();
+      const parser = new DOMParser();
+      const xml = parser.parseFromString(text, 'text/xml');
+      const items = [];
+
+      const responses = xml.querySelectorAll('response');
+      responses.forEach(resp => {
+        const href = resp.querySelector('href');
+        if (href) {
+          const name = decodeURIComponent(href.textContent.split('/').pop());
+          if (name && name.endsWith('.json')) {
+            items.push(name.replace('.json', ''));
+          }
+        }
+      });
+
+      return items;
+    } catch (error) {
+      return [];
+    }
+  }
+
+  // 获取文件信息
+  async stat(path) {
+    try {
+      const response = await this.request('PROPFIND', path, {
+        headers: {
+          'Content-Type': 'text/xml; charset=utf-8',
+          'Depth': '0'
+        },
+        body: `<?xml version="1.0" encoding="utf-8"?>
+          <propfind xmlns="DAV:">
+            <prop>
+              <getlastmodified/>
+              <getcontentlength/>
+            </prop>
+          </propfind>`
+      });
+
+      const text = await response.text();
+      const parser = new DOMParser();
+      const xml = parser.parseFromString(text, 'text/xml');
+
+      const modified = xml.querySelector('getlastmodified');
+      const length = xml.querySelector('getcontentlength');
+
+      return {
+        exists: true,
+        modified: modified ? new Date(modified.textContent).getTime() : 0,
+        size: length ? parseInt(length.textContent) : 0
+      };
+    } catch (error) {
+      if (error.message.includes('404')) {
+        return { exists: false };
+      }
+      throw error;
+    }
+  }
+}
+
+// ==================== 数据存储（支持本地和同步）====================
+const Storage = {
+  keys: {
+    todos: 'fangkong_todos',
+    notes: 'fangkong_notes',
+    accounts: 'fangkong_accounts',
+    trash: 'fangkong_trash',
+    webdavConfig: 'fangkong_webdav_config',
+    syncState: 'fangkong_sync_state',
+    lastSyncTime: 'fangkong_last_sync',
+    settings: 'fangkong_settings',
+    dataVersion: 'fangkong_data_version'
+  },
+
+  // WebDAV 客户端实例
+  webdav: null,
+
+  // 当前数据格式版本
+  currentVersion: 4,
+
+  // 初始化
+  init() {
+    this.migrateData();
+    return this.initWebDAV();
+  },
+
+  // 数据迁移：从旧版本格式迁移到当前格式
+  migrateData() {
+    const storedVersion = parseInt(localStorage.getItem(this.keys.dataVersion)) || 1;
+    if (storedVersion >= this.currentVersion) return;
+
+    if (storedVersion < 2) {
+      this.migrateV1ToV2();
+    }
+    if (storedVersion < 3) {
+      this.migrateV2ToV3();
+    }
+    if (storedVersion < 4) {
+      this.migrateV3ToV4();
+    }
+
+    localStorage.setItem(this.keys.dataVersion, String(this.currentVersion));
+  },
+
+  migrateV1ToV2() {
+    // 迁移待办数据
+    const todos = this.get(this.keys.todos);
+    if (todos.length > 0 && todos[0].hasOwnProperty('description')) {
+      const migratedTodos = todos.map(t => ({
+        id: t.id,
+        title: t.title,
+        content: t.description || t.content || '',
+        reminder: t.dueDate || t.reminder || '',
+        reminderOffset: t.reminderOffset || 0,
+        repeat: t.repeat || 'never',
+        repeatDays: t.repeatDays || 0,
+        repeatFreq: t.repeatFreq || 1,
+        repeatParentId: t.repeatParentId || null,
+        completed: t.completed || false,
+        pinned: t.pinned || false,
+        linkTitles: t.linkTitles || {},
+        created_at: t.createdAt || t.created_at || new Date().toISOString(),
+        updated_at: t.updatedAt || t.updated_at || new Date().toISOString()
+      }));
+      this.set(this.keys.todos, migratedTodos);
+    }
+
+    // 迁移笔记数据
+    const notes = this.get(this.keys.notes);
+    if (notes.length > 0 && notes[0].hasOwnProperty('createdAt')) {
+      const migratedNotes = notes.map(n => ({
+        id: n.id,
+        title: n.title,
+        content: n.content || '',
+        is_pinned: n.is_pinned || false,
+        is_protected: n.is_protected || false,
+        is_encrypted: n.is_encrypted || false,
+        created_at: n.createdAt || n.created_at || new Date().toISOString(),
+        updated_at: n.updatedAt || n.updated_at || new Date().toISOString()
+      }));
+      this.set(this.keys.notes, migratedNotes);
+    }
+
+    // 迁移记账数据
+    const accounts = this.get(this.keys.accounts);
+    if (accounts.length > 0 && !accounts[0].hasOwnProperty('created_at')) {
+      const migratedAccounts = accounts.map(a => ({
+        id: a.id,
+        type: a.type,
+        amount: a.amount,
+        category: a.category,
+        date: a.date,
+        remark: a.remark || '',
+        noteId: a.noteId || null,
+        created_at: a.created_at || new Date().toISOString()
+      }));
+      this.set(this.keys.accounts, migratedAccounts);
+    }
+
+    // 迁移回收站数据：将独立 trash 数组合并回 todos/notes 数组（设置 deleted=1）
+    const trash = this.get(this.keys.trash);
+    if (trash.length > 0) {
+      const todos = this.get(this.keys.todos);
+      const notes = this.get(this.keys.notes);
+
+      trash.forEach(item => {
+        const base = {
+          id: item.id,
+          title: item.title || '',
+          content: item.content || '',
+          created_at: item.createdAt || item.created_at || new Date().toISOString(),
+          updated_at: item.deletedAt || item.updatedAt || item.updated_at || new Date().toISOString(),
+          deleted: 1
+        };
+        if (item.type === 'todo') {
+          const existing = todos.find(t => t.id === item.id);
+          if (!existing) {
+            todos.push({
+              ...base,
+              content: item.description || item.content || '',
+              reminder: item.dueDate || item.reminder || '',
+              reminderOffset: item.reminderOffset || 0,
+              repeat: item.repeat || 'never',
+              repeatDays: item.repeatDays || 0,
+              completed: item.completed || false,
+              pinned: item.pinned || false,
+              linkTitles: item.linkTitles || {}
+            });
+          } else {
+            existing.deleted = 1;
+            existing.updated_at = base.updated_at;
+          }
+        } else {
+          const existing = notes.find(n => n.id === item.id);
+          if (!existing) {
+            notes.push({
+              ...base,
+              is_pinned: item.is_pinned || false,
+              is_protected: item.is_protected || false,
+              is_encrypted: item.is_encrypted || false
+            });
+          } else {
+            existing.deleted = 1;
+            existing.updated_at = base.updated_at;
+          }
+        }
+      });
+
+      this.set(this.keys.todos, todos);
+      this.set(this.keys.notes, notes);
+      this.set(this.keys.trash, []); // 清空旧 trash 数组
+    }
+  },
+
+  migrateV2ToV3() {
+    // 将 pinnedNotes 合并到笔记的 is_pinned 字段
+    try {
+      const pinnedNotesRaw = localStorage.getItem('fangkong_pinned_notes');
+      if (pinnedNotesRaw) {
+        const pinnedIds = JSON.parse(pinnedNotesRaw);
+        if (Array.isArray(pinnedIds) && pinnedIds.length > 0) {
+          const notes = this.get(this.keys.notes);
+          let changed = false;
+          notes.forEach(n => {
+            if (pinnedIds.includes(n.id)) {
+              n.is_pinned = true;
+              changed = true;
+            }
+          });
+          if (changed) {
+            this.set(this.keys.notes, notes);
+          }
+        }
+        localStorage.removeItem('fangkong_pinned_notes');
+      }
+    } catch (e) {
+      console.error('迁移 pinnedNotes 失败:', e);
+    }
+  },
+
+  migrateV3ToV4() {
+    // 将独立 trash 数组中的数据合并回 todos/notes 数组，使用 deleted=1 标记
+    try {
+      const trash = this.get(this.keys.trash);
+      if (trash.length === 0) return;
+
+      const todos = this.get(this.keys.todos);
+      const notes = this.get(this.keys.notes);
+
+      trash.forEach(item => {
+        if (item.type === 'todo') {
+          const existing = todos.find(t => t.id === item.id);
+          if (existing) {
+            existing.deleted = 1;
+            existing.updated_at = item.deletedAt || item.updated_at || new Date().toISOString();
+          } else {
+            todos.push({
+              id: item.id,
+              title: item.title || '',
+              content: item.content || item.description || '',
+              reminder: item.reminder || item.dueDate || '',
+              reminderOffset: item.reminderOffset || 0,
+              repeat: item.repeat || 'never',
+              repeatDays: item.repeatDays || 0,
+              completed: item.completed || false,
+              pinned: item.pinned || false,
+              linkTitles: item.linkTitles || {},
+              created_at: item.created_at || item.createdAt || new Date().toISOString(),
+              updated_at: item.deletedAt || item.updated_at || new Date().toISOString(),
+              deleted: 1
+            });
+          }
+        } else {
+          const existing = notes.find(n => n.id === item.id);
+          if (existing) {
+            existing.deleted = 1;
+            existing.updated_at = item.deletedAt || item.updated_at || new Date().toISOString();
+          } else {
+            notes.push({
+              id: item.id,
+              title: item.title || '',
+              content: item.content || '',
+              is_pinned: item.is_pinned || false,
+              is_protected: item.is_protected || false,
+              is_encrypted: item.is_encrypted || false,
+              created_at: item.created_at || item.createdAt || new Date().toISOString(),
+              updated_at: item.deletedAt || item.updated_at || new Date().toISOString(),
+              deleted: 1
+            });
+          }
+        }
+      });
+
+      this.set(this.keys.todos, todos);
+      this.set(this.keys.notes, notes);
+      this.set(this.keys.trash, []); // 清空旧 trash 数组
+      console.log('migrateV3ToV4: 已迁移', trash.length, '个回收站项目到 deleted 标记');
+    } catch (e) {
+      console.error('迁移 trash 到 deleted 标记失败:', e);
+    }
+  },
+
+  // 初始化 WebDAV
+  initWebDAV() {
+    const config = this.getWebDAVConfig();
+    if (config && config.enabled) {
+      this.webdav = new WebDAVClient(config);
+      return true;
+    }
+    this.webdav = null;
+    return false;
+  },
+
+  // 获取 WebDAV 配置
+  getWebDAVConfig() {
+    try {
+      const config = localStorage.getItem(this.keys.webdavConfig);
+      return config ? JSON.parse(config) : null;
+    } catch (e) {
+      return null;
+    }
+  },
+
+  // 保存 WebDAV 配置
+  setWebDAVConfig(config) {
+    localStorage.setItem(this.keys.webdavConfig, JSON.stringify(config));
+    this.initWebDAV();
+  },
+
+  // 清除 WebDAV 配置
+  clearWebDAVConfig() {
+    localStorage.removeItem(this.keys.webdavConfig);
+    this.webdav = null;
+  },
+
+  // 获取本地数据
+  getLocalData() {
+    return {
+      todos: this.get(this.keys.todos),
+      notes: this.get(this.keys.notes),
+      accounts: this.get(this.keys.accounts),
+      updatedAt: this.get(this.keys.lastSyncTime) || Date.now()
+    };
+  },
+
+  get(key) {
+    try {
+      const data = localStorage.getItem(key);
+      return data ? JSON.parse(data) : [];
+    } catch (e) {
+      console.error('读取数据失败:', e);
+      return [];
+    }
+  },
+
+  set(key, data) {
+    try {
+      localStorage.setItem(key, JSON.stringify(data));
+      return true;
+    } catch (e) {
+      console.error('保存数据失败:', e);
+      return false;
+    }
+  },
+
+  // 设置完整本地数据
+  setLocalData(data) {
+    if (data.todos) this.set(this.keys.todos, data.todos);
+    if (data.notes) this.set(this.keys.notes, data.notes);
+    if (data.accounts) this.set(this.keys.accounts, data.accounts);
+    this.set(this.keys.lastSyncTime, Date.now());
+  },
+
+  // 导出所有数据
+  export() {
+    return {
+      ...this.getLocalData(),
+      exportTime: new Date().toISOString()
+    };
+  },
+
+  // 导入数据
+  import(data) {
+    this.setLocalData(data);
+  },
+
+  // 清空所有数据
+  clear() {
+    Object.values(this.keys).forEach(key => {
+      if (!key.includes('webdav')) { // 保留 WebDAV 配置
+        localStorage.removeItem(key);
+      }
+    });
+  },
+
+  // ==================== 格式转换（本地格式 ↔ 桌面版格式）====================
+
+  // 本地 todo → 桌面版格式
+  _todoToDesktop(todo) {
+    const id = typeof todo.id === 'string' ? parseInt(todo.id, 10) || Date.now() : todo.id;
+    return {
+      id,
+      title: todo.title || '',
+      content: todo.content || '',
+      completed: todo.completed ? 1 : 0,
+      reminder: todo.reminder || null,
+      reminderOffset: todo.reminderOffset || 0,
+      repeat: todo.repeat || 'never',
+      repeatDays: todo.repeatDays || 0,
+      repeatStopped: todo.repeatStopped ? 1 : 0,
+      repeatParentId: todo.repeatParentId || null,
+      pinned: todo.pinned ? 1 : 0,
+      linkTitles: todo.linkTitles || {},
+      created_at: todo.created_at || new Date().toISOString(),
+      updated_at: todo.updated_at || todo.created_at || new Date().toISOString(),
+      deleted: 0
+    };
+  },
+
+  // 桌面版 todo → 本地格式
+  _todoFromDesktop(todo) {
+    return {
+      ...todo,
+      completed: !!todo.completed,
+      pinned: !!todo.pinned,
+      repeatStopped: !!todo.repeatStopped
+    };
+  },
+
+  // 本地 note → 桌面版格式
+  _noteToDesktop(note) {
+    const id = typeof note.id === 'string' ? parseInt(note.id, 10) || Date.now() : note.id;
+    return {
+      id,
+      title: note.title || '无标题',
+      content: note.content || '',
+      is_encrypted: note.is_encrypted ? 1 : 0,
+      is_pinned: note.is_pinned ? 1 : 0,
+      created_at: note.created_at || new Date().toISOString(),
+      updated_at: note.updated_at || note.created_at || new Date().toISOString(),
+      deleted: 0
+    };
+  },
+
+  // 桌面版 note → 本地格式
+  _noteFromDesktop(note) {
+    return {
+      ...note,
+      is_encrypted: !!note.is_encrypted,
+      is_pinned: !!note.is_pinned
+    };
+  },
+
+  // 构建桌面版索引
+  _buildDesktopIndex(todos, notes) {
+    const index = { todos: {}, notes: {}, version: 2 };
+
+    todos.forEach(todo => {
+      const dt = this._todoToDesktop(todo);
+      index.todos[String(dt.id)] = {
+        updated_at: dt.updated_at,
+        deleted: dt.deleted,
+        title: dt.title
+      };
+    });
+
+    notes.forEach(note => {
+      const dt = this._noteToDesktop(note);
+      index.notes[String(dt.id)] = {
+        updated_at: dt.updated_at,
+        deleted: dt.deleted,
+        title: dt.title
+      };
+    });
+
+    return index;
+  },
+
+  // 获取同步状态
+  _getSyncState() {
+    try {
+      const raw = localStorage.getItem(this.keys.syncState);
+      return raw ? JSON.parse(raw) : { lastSyncTime: 0, remoteVersions: {} };
+    } catch (e) {
+      return { lastSyncTime: 0, remoteVersions: {} };
+    }
+  },
+
+  // 保存同步状态
+  _setSyncState(state) {
+    localStorage.setItem(this.keys.syncState, JSON.stringify(state));
+  },
+
+  // ==================== 增量同步（兼容桌面版格式）====================
+
+  async sync() {
+    if (!this.webdav) {
+      return { success: false, error: 'WebDAV 未配置' };
+    }
+
+    const syncStartTime = Date.now();
+    const stats = { uploaded: { todos: 0, notes: 0 }, downloaded: { todos: 0, notes: 0 }, deleted: { todos: 0, notes: 0 }, conflicts: 0 };
+
+    try {
+      // 1. 获取本地数据并构建索引
+      const localTodos = this.get(this.keys.todos);
+      const localNotes = this.get(this.keys.notes);
+      const localIndex = this._buildDesktopIndex(localTodos, localNotes);
+      const syncState = this._getSyncState();
+
+      // 2. 下载远程索引
+      let remoteIndex = null;
+      try {
+        remoteIndex = await this.webdav.download('/fangkong_v2/index.json');
+      } catch (e) {
+        console.log('远程索引不存在，执行首次全量同步...');
+      }
+
+      // 3. 如果远程索引不存在，执行首次全量同步
+      if (!remoteIndex) {
+        return await this._doFullSync(localIndex, localTodos, localNotes, stats);
+      }
+
+      console.log(`本地: ${Object.keys(localIndex.todos).length} 待办, ${Object.keys(localIndex.notes).length} 笔记`);
+      console.log(`远程: ${Object.keys(remoteIndex.todos || {}).length} 待办, ${Object.keys(remoteIndex.notes || {}).length} 笔记`);
+
+      // 4. 合并后的索引
+      const mergedIndex = {
+        todos: { ...localIndex.todos },
+        notes: { ...localIndex.notes },
+        version: 2
+      };
+
+      // 5. 同步待办
+      await this._syncType('todos', localIndex, remoteIndex, mergedIndex, stats, syncState.remoteVersions);
+
+      // 6. 同步笔记
+      await this._syncType('notes', localIndex, remoteIndex, mergedIndex, stats, syncState.remoteVersions);
+
+      // 7. 上传合并后的索引
+      await this.webdav.upload('/fangkong_v2/index.json', mergedIndex);
+
+      // 8. 更新同步状态
+      this._setSyncState({
+        lastSyncTime: syncStartTime,
+        remoteVersions: mergedIndex
+      });
+      this.set(this.keys.lastSyncTime, syncStartTime);
+
+      const totalUp = stats.uploaded.todos + stats.uploaded.notes;
+      const totalDown = stats.downloaded.todos + stats.downloaded.notes;
+      const totalDel = stats.deleted.todos + stats.deleted.notes;
+
+      return {
+        success: true,
+        message: `同步完成 ↑${totalUp} ↓${totalDown} 🗑${totalDel}`,
+        stats
+      };
+
+    } catch (error) {
+      console.error('Sync failed:', error);
+      return { success: false, error: error.message };
+    }
+  },
+
+  // 同步某一类数据
+  async _syncType(type, localIndex, remoteIndex, mergedIndex, stats, lastRemoteVersions = {}) {
+    const localItems = localIndex[type] || {};
+    const remoteItems = remoteIndex[type] || {};
+    const lastRemoteItems = lastRemoteVersions[type] || {};
+    const allIds = new Set([...Object.keys(localItems), ...Object.keys(remoteItems)]);
+
+    // 检测本地彻底删除的项目
+    for (const idStr of Object.keys(lastRemoteItems)) {
+      if (!localItems[idStr]) {
+        console.log(`[${type}] 本地彻底删除: ${idStr}，同步删除到云端`);
+        await this.webdav.delete(`/fangkong_v2/${type}/${idStr}.json`);
+        stats.deleted[type === 'todos' ? 'todos' : 'notes']++;
+      }
+    }
+
+    for (const idStr of allIds) {
+      const localMeta = localItems[idStr];
+      const remoteMeta = remoteItems[idStr];
+      const id = parseInt(idStr, 10);
+
+      // 情况1：本地有，远程没有 → 上传
+      if (localMeta && !remoteMeta) {
+        if (!localMeta.deleted) {
+          console.log(`[${type}] 上传新增: ${id}`);
+          const item = type === 'todos'
+            ? this._todoToDesktop(this.get(this.keys.todos).find(t => String(t.id) === idStr) || {})
+            : this._noteToDesktop(this.get(this.keys.notes).find(n => String(n.id) === idStr) || {});
+          if (item && item.id) {
+            await this.webdav.upload(`/fangkong_v2/${type}/${idStr}.json`, item);
+            stats.uploaded[type === 'todos' ? 'todos' : 'notes']++;
+            mergedIndex[type][idStr] = localMeta;
+          }
+        }
+        continue;
+      }
+
+      // 情况2：远程有，本地没有 → 下载
+      if (!localMeta && remoteMeta) {
+        if (!remoteMeta.deleted) {
+          console.log(`[${type}] 下载新增: ${id}`);
+          const item = await this.webdav.download(`/fangkong_v2/${type}/${idStr}.json`);
+          if (item) {
+            this._mergeItemFromRemote(type, item);
+            stats.downloaded[type === 'todos' ? 'todos' : 'notes']++;
+            mergedIndex[type][idStr] = remoteMeta;
+          }
+        } else {
+          mergedIndex[type][idStr] = remoteMeta;
+        }
+        continue;
+      }
+
+      // 情况3：两边都有 → 比较更新时间
+      const localTime = new Date(localMeta.updated_at || 0).getTime();
+      const remoteTime = new Date(remoteMeta.updated_at || 0).getTime();
+
+      // 处理删除状态
+      if (localMeta.deleted && !remoteMeta.deleted && localTime > remoteTime) {
+        console.log(`[${type}] 本地删除较新，同步删除到云端: ${id}`);
+        mergedIndex[type][idStr] = localMeta;
+        stats.deleted[type === 'todos' ? 'todos' : 'notes']++;
+        continue;
+      }
+
+      if (!localMeta.deleted && remoteMeta.deleted && remoteTime > localTime) {
+        console.log(`[${type}] 远程删除较新，同步删除到本地: ${id}`);
+        this._softDeleteLocalItem(type, idStr, remoteMeta.updated_at);
+        mergedIndex[type][idStr] = remoteMeta;
+        stats.deleted[type === 'todos' ? 'todos' : 'notes']++;
+        continue;
+      }
+
+      if (localMeta.deleted && remoteMeta.deleted) {
+        mergedIndex[type][idStr] = localTime > remoteTime ? localMeta : remoteMeta;
+        continue;
+      }
+
+      // 正常数据同步
+      if (localTime > remoteTime) {
+        console.log(`[${type}] 上传更新: ${id}`);
+        const item = type === 'todos'
+          ? this._todoToDesktop(this.get(this.keys.todos).find(t => String(t.id) === idStr) || {})
+          : this._noteToDesktop(this.get(this.keys.notes).find(n => String(n.id) === idStr) || {});
+        if (item && item.id) {
+          await this.webdav.upload(`/fangkong_v2/${type}/${idStr}.json`, item);
+          stats.uploaded[type === 'todos' ? 'todos' : 'notes']++;
+          mergedIndex[type][idStr] = localMeta;
+        }
+      } else if (remoteTime > localTime) {
+        console.log(`[${type}] 下载更新: ${id}`);
+        const item = await this.webdav.download(`/fangkong_v2/${type}/${idStr}.json`);
+        if (item) {
+          this._mergeItemFromRemote(type, item);
+          stats.downloaded[type === 'todos' ? 'todos' : 'notes']++;
+          mergedIndex[type][idStr] = remoteMeta;
+        }
+      } else {
+        mergedIndex[type][idStr] = localMeta;
+      }
+    }
+  },
+
+  // 从远程合并单个项目到本地
+  _mergeItemFromRemote(type, item) {
+    if (type === 'todos') {
+      const todos = this.get(this.keys.todos);
+      const idStr = String(item.id);
+      const existingIndex = todos.findIndex(t => String(t.id) === idStr);
+      const converted = this._todoFromDesktop(item);
+
+      if (existingIndex >= 0) {
+        // 保留本地较新的版本
+        const existing = todos[existingIndex];
+        const existingTime = new Date(existing.updated_at || 0).getTime();
+        const remoteTime = new Date(item.updated_at || 0).getTime();
+        if (remoteTime > existingTime) {
+          todos[existingIndex] = converted;
+        }
+      } else {
+        todos.push(converted);
+      }
+      this.set(this.keys.todos, todos);
+    } else {
+      const notes = this.get(this.keys.notes);
+      const idStr = String(item.id);
+      const existingIndex = notes.findIndex(n => String(n.id) === idStr);
+      const converted = this._noteFromDesktop(item);
+
+      if (existingIndex >= 0) {
+        const existing = notes[existingIndex];
+        const existingTime = new Date(existing.updated_at || 0).getTime();
+        const remoteTime = new Date(item.updated_at || 0).getTime();
+        if (remoteTime > existingTime) {
+          notes[existingIndex] = converted;
+        }
+      } else {
+        notes.push(converted);
+      }
+      this.set(this.keys.notes, notes);
+    }
+  },
+
+  // 软删除本地项目
+  _softDeleteLocalItem(type, idStr, updatedAt) {
+    if (type === 'todos') {
+      const todos = this.get(this.keys.todos);
+      const idx = todos.findIndex(t => String(t.id) === idStr);
+      if (idx >= 0) {
+        todos[idx].deleted = 1;
+        todos[idx].updated_at = updatedAt;
+        this.set(this.keys.todos, todos);
+      }
+    } else {
+      const notes = this.get(this.keys.notes);
+      const idx = notes.findIndex(n => String(n.id) === idStr);
+      if (idx >= 0) {
+        notes[idx].deleted = 1;
+        notes[idx].updated_at = updatedAt;
+        this.set(this.keys.notes, notes);
+      }
+    }
+  },
+
+  // 首次全量同步
+  async _doFullSync(localIndex, localTodos, localNotes, stats) {
+    console.log('执行首次全量同步...');
+
+    // 创建远程目录
+    try { await this.webdav.request('MKCOL', '/fangkong_v2'); } catch (e) { /* 可能已存在 */ }
+    try { await this.webdav.request('MKCOL', '/fangkong_v2/todos'); } catch (e) { }
+    try { await this.webdav.request('MKCOL', '/fangkong_v2/notes'); } catch (e) { }
+
+    // 上传所有待办
+    for (const todo of localTodos) {
+      const dt = this._todoToDesktop(todo);
+      if (!dt.deleted) {
+        await this.webdav.upload(`/fangkong_v2/todos/${dt.id}.json`, dt);
+        stats.uploaded.todos++;
+      }
+    }
+
+    // 上传所有笔记
+    for (const note of localNotes) {
+      const dt = this._noteToDesktop(note);
+      if (!dt.deleted) {
+        await this.webdav.upload(`/fangkong_v2/notes/${dt.id}.json`, dt);
+        stats.uploaded.notes++;
+      }
+    }
+
+    // 上传索引
+    await this.webdav.upload('/fangkong_v2/index.json', localIndex);
+
+    // 更新同步状态
+    this._setSyncState({
+      lastSyncTime: Date.now(),
+      remoteVersions: localIndex
+    });
+    this.set(this.keys.lastSyncTime, Date.now());
+
+    return {
+      success: true,
+      message: `首次同步完成 ↑${stats.uploaded.todos + stats.uploaded.notes}`,
+      stats
+    };
+  },
+
+  // 强制从云端下载
+  async forceDownload() {
+    if (!this.webdav) return { success: false, error: 'WebDAV 未配置' };
+
+    try {
+      // 下载远程索引
+      const remoteIndex = await this.webdav.download('/fangkong_v2/index.json');
+      if (!remoteIndex) {
+        return { success: false, error: '云端没有数据' };
+      }
+
+      const todos = [];
+      const notes = [];
+
+      // 下载所有待办
+      for (const idStr of Object.keys(remoteIndex.todos || {})) {
+        const item = await this.webdav.download(`/fangkong_v2/todos/${idStr}.json`);
+        if (item) {
+          todos.push(this._todoFromDesktop(item));
+        }
+      }
+
+      // 下载所有笔记
+      for (const idStr of Object.keys(remoteIndex.notes || {})) {
+        const item = await this.webdav.download(`/fangkong_v2/notes/${idStr}.json`);
+        if (item) {
+          notes.push(this._noteFromDesktop(item));
+        }
+      }
+
+      this.set(this.keys.todos, todos);
+      this.set(this.keys.notes, notes);
+      this.set(this.keys.lastSyncTime, Date.now());
+
+      return { success: true, message: `已下载 ${todos.length} 个待办, ${notes.length} 个笔记` };
+    } catch (error) {
+      return { success: false, error: error.message };
+    }
+  },
+
+  // 强制上传到云端
+  async forceUpload() {
+    if (!this.webdav) return { success: false, error: 'WebDAV 未配置' };
+
+    const localTodos = this.get(this.keys.todos);
+    const localNotes = this.get(this.keys.notes);
+    const localIndex = this._buildDesktopIndex(localTodos, localNotes);
+    const stats = { uploaded: { todos: 0, notes: 0 } };
+
+    try {
+      // 创建远程目录
+      try { await this.webdav.request('MKCOL', '/fangkong_v2'); } catch (e) { }
+      try { await this.webdav.request('MKCOL', '/fangkong_v2/todos'); } catch (e) { }
+      try { await this.webdav.request('MKCOL', '/fangkong_v2/notes'); } catch (e) { }
+
+      for (const todo of localTodos) {
+        const dt = this._todoToDesktop(todo);
+        await this.webdav.upload(`/fangkong_v2/todos/${dt.id}.json`, dt);
+        stats.uploaded.todos++;
+      }
+
+      for (const note of localNotes) {
+        const dt = this._noteToDesktop(note);
+        await this.webdav.upload(`/fangkong_v2/notes/${dt.id}.json`, dt);
+        stats.uploaded.notes++;
+      }
+
+      await this.webdav.upload('/fangkong_v2/index.json', localIndex);
+      this.set(this.keys.lastSyncTime, Date.now());
+
+      return { success: true, message: `已上传 ${stats.uploaded.todos + stats.uploaded.notes} 个项目` };
+    } catch (error) {
+      return { success: false, error: error.message };
+    }
+  },
+
+};
+
+// ==================== 应用状态 ====================
+const AppState = {
+  currentView: 'todo',
+  editingTodoId: null,
+  editingNoteId: null,
+  editingAccountId: null,
+  currentMonth: new Date(),
+  showCompletedTodos: false,
+  todoBatchMode: false,
+  noteBatchMode: false,
+  selectedTodos: new Set(),
+  selectedNotes: new Set(),
+  notesSearchKeyword: '',
+  syncInProgress: false,
+  tempPassword: null,
+  isNotesViewUnlocked: false,
+  globalPasswordHash: null,
+  // 回收站
+  currentTrashTab: 'deleted-todos',
+  selectedDeletedTodos: new Set(),
+  selectedDeletedNotes: new Set(),
+  // 记账筛选
+  accountFilterType: 'all',
+  accountDateRange: { start: '', end: '' }
+};
+
+// ==================== DOM 元素 ====================
+const DOM = {};
+
+// ==================== 初始化 ====================
+document.addEventListener('DOMContentLoaded', () => {
+  initDOM();
+  initWebDAV();
+  bindEvents();
+  renderCurrentView();
+  initCalendar();
+  initCalculator();
+  initGlobalPassword();
+  initKeyboardShortcuts();
+});
+
+function initWebDAV() {
+  const hasWebDAV = Storage.init();
+  updateSyncStatus(hasWebDAV);
+}
+
+function updateSyncStatus(hasWebDAV) {
+  const syncStatus = document.getElementById('syncStatus');
+  const syncBtn = document.getElementById('syncNowBtn');
+
+  if (hasWebDAV) {
+    const config = Storage.getWebDAVConfig();
+    syncStatus.textContent = `☁️ 已连接 (${config.url.replace(/^https?:\/\//, '').split('/')[0]})`;
+    syncStatus.style.color = '#2d6a4f';
+    syncBtn.style.display = 'block';
+  } else {
+    syncStatus.textContent = '⚫ 未配置同步';
+    syncStatus.style.color = '#999';
+    syncBtn.style.display = 'none';
+  }
+}
+
+function initDOM() {
+  // 视图
+  DOM.views = {
+    todo: document.getElementById('todo-view'),
+    notes: document.getElementById('notes-view'),
+    account: document.getElementById('account-view'),
+    calendar: document.getElementById('calendar-view'),
+    trash: document.getElementById('trash-view')
+  };
+
+  // 导航
+  DOM.navItems = document.querySelectorAll('.nav-item');
+
+  // 待办
+  DOM.todoList = document.getElementById('todoList');
+  DOM.todoCountBadge = document.getElementById('todoCountBadge');
+  DOM.addTodoBtn = document.getElementById('addTodoBtn');
+  DOM.toggleShowCompleted = document.getElementById('toggleShowCompleted');
+  DOM.batchSelectTodosBtn = document.getElementById('batchSelectTodosBtn');
+  DOM.selectAllTodosBtn = document.getElementById('selectAllTodosBtn');
+  DOM.batchDeleteTodosBtn = document.getElementById('batchDeleteTodosBtn');
+
+  // 待办弹窗
+  DOM.todoModal = document.getElementById('todoModal');
+  DOM.todoModalTitle = document.getElementById('todoModalTitle');
+  DOM.todoTitleInput = document.getElementById('todoTitleInput');
+  DOM.todoDescInput = document.getElementById('todoDescInput');
+  DOM.todoDueDate = document.getElementById('todoDueDate');
+  DOM.todoReminderOffset = document.getElementById('todoReminderOffset');
+  DOM.todoRepeatSelect = document.getElementById('todoRepeatSelect');
+  DOM.todoRepeatDays = document.getElementById('todoRepeatDays');
+  DOM.repeatDaysRow = document.getElementById('repeatDaysRow');
+  DOM.saveTodoBtn = document.getElementById('saveTodoBtn');
+  DOM.cancelTodoBtn = document.getElementById('cancelTodoBtn');
+  DOM.closeTodoModal = document.getElementById('closeTodoModal');
+
+  // 笔记
+  DOM.notesList = document.getElementById('notesList');
+  DOM.noteCountBadge = document.getElementById('noteCountBadge');
+  DOM.addNoteBtn = document.getElementById('addNoteBtn');
+  DOM.noteEditorPanel = document.getElementById('noteEditorPanel');
+  DOM.noteMeta = document.getElementById('noteMeta');
+  DOM.noteEditor = document.getElementById('noteEditor');
+  DOM.saveNoteBtn = document.getElementById('saveNoteBtn');
+  DOM.cancelNoteBtn = document.getElementById('cancelNoteBtn');
+  DOM.deleteNoteBtn = document.getElementById('deleteNoteBtn');
+  DOM.toggleEditBtn = document.getElementById('toggleEditBtn');
+  DOM.togglePinNoteBtn = document.getElementById('togglePinNoteBtn');
+  DOM.toggleEncryptBtn = document.getElementById('toggleEncryptBtn');
+  DOM.saveIndicator = document.getElementById('saveIndicator');
+  DOM.notesSearchInput = document.getElementById('notesSearchInput');
+  DOM.clearSearchBtn = document.getElementById('clearSearchBtn');
+  DOM.batchSelectNotesBtn = document.getElementById('batchSelectNotesBtn');
+  DOM.selectAllNotesBtn = document.getElementById('selectAllNotesBtn');
+  DOM.batchDeleteNotesBtn = document.getElementById('batchDeleteNotesBtn');
+
+  // 日历
+  DOM.calendarGrid = document.getElementById('calendarGrid');
+  DOM.yearSelect = document.getElementById('yearSelect');
+  DOM.monthSelect = document.getElementById('monthSelect');
+  DOM.prevMonth = document.getElementById('prevMonth');
+  DOM.nextMonth = document.getElementById('nextMonth');
+  DOM.todayBtn = document.getElementById('todayBtn');
+  DOM.dayDetailModal = document.getElementById('dayDetailModal');
+  DOM.closeDayDetail = document.getElementById('closeDayDetail');
+  DOM.detailDate = document.getElementById('detailDate');
+  DOM.dayTodosList = document.getElementById('dayTodosList');
+  DOM.dayNotesList = document.getElementById('dayNotesList');
+  DOM.dayTodosSection = document.getElementById('dayTodosSection');
+  DOM.dayNotesSection = document.getElementById('dayNotesSection');
+
+  // 回收站
+  DOM.trashTodosList = document.getElementById('trashTodosList');
+  DOM.trashNotesList = document.getElementById('trashNotesList');
+  DOM.emptyTrashBtn = document.getElementById('emptyTrashBtn');
+
+  // 记账
+  DOM.monthIncome = document.getElementById('monthIncome');
+  DOM.monthExpense = document.getElementById('monthExpense');
+  DOM.monthBalance = document.getElementById('monthBalance');
+  DOM.accountList = document.getElementById('accountList');
+  DOM.addAccountBtn = document.getElementById('addAccountBtn');
+
+  // 记账弹窗
+  DOM.accountModal = document.getElementById('accountModal');
+  DOM.accountType = document.getElementById('accountType');
+  DOM.accountAmount = document.getElementById('accountAmount');
+  DOM.accountCategory = document.getElementById('accountCategory');
+  DOM.accountDate = document.getElementById('accountDate');
+  DOM.accountRemark = document.getElementById('accountRemark');
+  DOM.saveAccountBtn = document.getElementById('saveAccountBtn');
+  DOM.cancelAccountBtn = document.getElementById('cancelAccountBtn');
+  DOM.closeAccountModal = document.getElementById('closeAccountModal');
+
+  // 数据管理
+  DOM.exportDataBtn = document.getElementById('exportDataBtn');
+  DOM.importDataBtn = document.getElementById('importDataBtn');
+  DOM.clearAllBtn = document.getElementById('clearAllBtn');
+  DOM.dataModal = document.getElementById('dataModal');
+  DOM.dataModalTitle = document.getElementById('dataModalTitle');
+  DOM.dataModalContent = document.getElementById('dataModalContent');
+  DOM.closeDataModal = document.getElementById('closeDataModal');
+
+  // WebDAV
+  DOM.configWebDAV = document.getElementById('configWebDAV');
+  DOM.syncNowBtn = document.getElementById('syncNowBtn');
+  DOM.webdavModal = document.getElementById('webdavModal');
+  DOM.closeWebDAVModal = document.getElementById('closeWebDAVModal');
+  DOM.webdavUrl = document.getElementById('webdavUrl');
+  DOM.webdavUsername = document.getElementById('webdavUsername');
+  DOM.webdavPassword = document.getElementById('webdavPassword');
+  DOM.webdavPath = document.getElementById('webdavPath');
+  DOM.testWebDAVBtn = document.getElementById('testWebDAVBtn');
+  DOM.saveWebDAVBtn = document.getElementById('saveWebDAVBtn');
+  DOM.cancelWebDAVBtn = document.getElementById('cancelWebDAVBtn');
+  DOM.disconnectWebDAVBtn = document.getElementById('disconnectWebDAVBtn');
+
+  // 冲突解决
+  DOM.conflictModal = document.getElementById('conflictModal');
+  DOM.cancelConflictBtn = document.getElementById('cancelConflictBtn');
+  DOM.keepLocalBtn = document.getElementById('keepLocalBtn');
+  DOM.keepRemoteBtn = document.getElementById('keepRemoteBtn');
+  DOM.mergeDataBtn = document.getElementById('mergeDataBtn');
+  DOM.localStats = document.getElementById('localStats');
+  DOM.remoteStats = document.getElementById('remoteStats');
+  DOM.localTime = document.getElementById('localTime');
+  DOM.remoteTime = document.getElementById('remoteTime');
+}
+
+// ==================== 事件绑定 ====================
+function bindEvents() {
+  // 导航切换
+  DOM.navItems.forEach(item => {
+    item.addEventListener('click', () => {
+      const view = item.dataset.view;
+      switchView(view);
+    });
+  });
+
+  // 待办
+  DOM.addTodoBtn.addEventListener('click', () => openTodoModal());
+  DOM.toggleShowCompleted.addEventListener('click', toggleShowCompleted);
+  DOM.batchSelectTodosBtn.addEventListener('click', toggleTodoBatchMode);
+  DOM.selectAllTodosBtn.addEventListener('click', selectAllTodos);
+  DOM.batchDeleteTodosBtn.addEventListener('click', batchDeleteTodos);
+  DOM.saveTodoBtn.addEventListener('click', saveTodo);
+  DOM.cancelTodoBtn.addEventListener('click', closeTodoModal);
+  DOM.closeTodoModal.addEventListener('click', closeTodoModal);
+  DOM.todoRepeatSelect.addEventListener('change', toggleRepeatFreq);
+
+  // 笔记
+  DOM.addNoteBtn.addEventListener('click', () => openNoteEditor());
+  DOM.saveNoteBtn.addEventListener('click', saveNote);
+  DOM.cancelNoteBtn.addEventListener('click', closeNoteEditor);
+  DOM.deleteNoteBtn.addEventListener('click', deleteCurrentNote);
+  DOM.toggleEditBtn.addEventListener('click', toggleNoteEdit);
+  DOM.togglePinNoteBtn.addEventListener('click', togglePinNote);
+  DOM.toggleEncryptBtn.addEventListener('click', toggleNoteEncrypt);
+  DOM.notesSearchInput.addEventListener('input', searchNotes);
+  DOM.clearSearchBtn.addEventListener('click', clearSearch);
+  DOM.batchSelectNotesBtn.addEventListener('click', toggleNoteBatchMode);
+  DOM.selectAllNotesBtn.addEventListener('click', selectAllNotes);
+  DOM.batchDeleteNotesBtn.addEventListener('click', batchDeleteNotes);
+
+  // 日历
+  DOM.prevMonth.addEventListener('click', () => changeMonth(-1));
+  DOM.nextMonth.addEventListener('click', () => changeMonth(1));
+  DOM.todayBtn.addEventListener('click', goToToday);
+  DOM.closeDayDetail.addEventListener('click', closeDayDetailModal);
+
+  // 回收站
+  DOM.emptyTrashBtn.addEventListener('click', emptyTrash);
+
+  // 记账
+  DOM.addAccountBtn.addEventListener('click', () => openAccountModal());
+  DOM.saveAccountBtn.addEventListener('click', saveAccount);
+  DOM.cancelAccountBtn.addEventListener('click', closeAccountModal);
+  DOM.closeAccountModal.addEventListener('click', closeAccountModal);
+
+  // 数据管理
+  DOM.exportDataBtn.addEventListener('click', exportData);
+  DOM.importDataBtn.addEventListener('click', importData);
+  DOM.clearAllBtn.addEventListener('click', clearAllData);
+  DOM.closeDataModal.addEventListener('click', closeDataModal);
+
+  // WebDAV
+  DOM.configWebDAV.addEventListener('click', openWebDAVModal);
+  DOM.syncNowBtn.addEventListener('click', syncNow);
+  DOM.closeWebDAVModal.addEventListener('click', closeWebDAVModal);
+  DOM.testWebDAVBtn.addEventListener('click', testWebDAV);
+  DOM.saveWebDAVBtn.addEventListener('click', saveWebDAVConfig);
+  DOM.cancelWebDAVBtn.addEventListener('click', closeWebDAVModal);
+  DOM.disconnectWebDAVBtn.addEventListener('click', disconnectWebDAV);
+
+  // 冲突解决
+  DOM.cancelConflictBtn.addEventListener('click', () => DOM.conflictModal.style.display = 'none');
+  DOM.keepLocalBtn.addEventListener('click', () => resolveConflict('local'));
+  DOM.keepRemoteBtn.addEventListener('click', () => resolveConflict('remote'));
+  DOM.mergeDataBtn.addEventListener('click', () => resolveConflict('merge'));
+
+  // 弹窗外部点击关闭
+  window.addEventListener('click', (e) => {
+    if (e.target.classList.contains('modal')) {
+      e.target.style.display = 'none';
+    }
+  });
+}
+
+// ==================== 键盘快捷键 ====================
+function initKeyboardShortcuts() {
+  document.addEventListener('keydown', (e) => {
+    // Escape 关闭弹窗
+    if (e.key === 'Escape') {
+      const modals = document.querySelectorAll('.modal');
+      modals.forEach(m => {
+        if (m.style.display === 'flex') m.style.display = 'none';
+      });
+      // 同时隐藏动态创建的菜单
+      const ctxMenu = document.getElementById('todoContextMenu');
+      if (ctxMenu) ctxMenu.style.display = 'none';
+      const noteCtxMenu = document.getElementById('noteCardContextMenu');
+      if (noteCtxMenu) noteCtxMenu.style.display = 'none';
+    }
+
+    // Ctrl+S 保存笔记
+    if (e.ctrlKey && e.key === 's') {
+      e.preventDefault();
+      if (AppState.currentView === 'notes' && DOM.noteEditorPanel.style.display === 'block') {
+        saveNote();
+      }
+    }
+  });
+}
+
+// ==================== 通用提示弹窗 ====================
+function showToast(message, type = 'success') {
+  const toast = document.createElement('div');
+  toast.textContent = message;
+  const bgColor = type === 'error' ? '#e76f51' : type === 'info' ? '#4a7c59' : '#4a7c59';
+  toast.style.cssText = `position:fixed;top:20px;left:50%;transform:translateX(-50%);background:${bgColor};color:white;padding:10px 20px;border-radius:8px;z-index:10000;box-shadow:0 2px 8px rgba(0,0,0,0.2);font-size:0.9rem;`;
+  document.body.appendChild(toast);
+  setTimeout(() => toast.remove(), 2000);
+}
+
+function showConfirmDialog(message, title = '⚠️ 确认操作') {
+  return new Promise((resolve) => {
+    const modal = document.getElementById('confirmModal');
+    if (modal) {
+      const titleEl = document.getElementById('confirmTitle');
+      const messageEl = document.getElementById('confirmMessage');
+      const okBtn = document.getElementById('confirmOkBtn');
+      const cancelBtn = document.getElementById('confirmCancelBtn');
+      if (titleEl) titleEl.textContent = title;
+      if (messageEl) messageEl.textContent = message;
+      modal.style.display = 'flex';
+
+      const newOk = okBtn.cloneNode(true);
+      const newCancel = cancelBtn.cloneNode(true);
+      okBtn.parentNode.replaceChild(newOk, okBtn);
+      cancelBtn.parentNode.replaceChild(newCancel, cancelBtn);
+
+      newOk.addEventListener('click', () => { modal.style.display = 'none'; resolve(true); });
+      newCancel.addEventListener('click', () => { modal.style.display = 'none'; resolve(false); });
+      modal.addEventListener('click', (e) => {
+        if (e.target === modal) { modal.style.display = 'none'; resolve(false); }
+      });
+    } else {
+      resolve(confirm(message));
+    }
+  });
+}
+
+function showCustomAlert(message, type = 'info') {
+  return new Promise((resolve) => {
+    const colors = { info: '#4a7c59', warning: '#e9c46a', error: '#e76f51' };
+    const overlay = document.createElement('div');
+    overlay.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.5);z-index:99999;display:flex;align-items:center;justify-content:center;';
+    overlay.innerHTML = `
+      <div style="background:#fff;padding:24px 32px;border-radius:12px;box-shadow:0 8px 32px rgba(0,0,0,0.2);max-width:360px;text-align:center;">
+        <div style="font-size:1.1rem;margin-bottom:16px;color:#333;">${escapeHtml(message)}</div>
+        <button id="customAlertBtn" style="background:${colors[type] || colors.info};color:#fff;border:none;padding:10px 24px;border-radius:6px;cursor:pointer;font-size:0.95rem;">确定</button>
+      </div>
+    `;
+    document.body.appendChild(overlay);
+    overlay.addEventListener('click', (e) => {
+      if (e.target === overlay || e.target.id === 'customAlertBtn') {
+        overlay.remove();
+        resolve();
+      }
+    });
+  });
+}
+
+// ==================== 计算器 ====================
+function initCalculator() {
+  let calcBtn = document.getElementById('calcBtn');
+  let calcModal = document.getElementById('calcModal');
+
+  // 如果 HTML 中没有，动态创建按钮和弹窗
+  if (!calcBtn) {
+    const sidebar = document.querySelector('.sidebar');
+    if (sidebar) {
+      calcBtn = document.createElement('button');
+      calcBtn.id = 'calcBtn';
+      calcBtn.className = 'btn btn-outline';
+      calcBtn.style.cssText = 'width:100%;margin-top:8px;';
+      calcBtn.textContent = '🧮 计算器';
+      sidebar.appendChild(calcBtn);
+    }
+  }
+
+  if (!calcModal) {
+    calcModal = document.createElement('div');
+    calcModal.id = 'calcModal';
+    calcModal.className = 'modal';
+    calcModal.style.cssText = 'display:none;align-items:center;justify-content:center;';
+    calcModal.innerHTML = `
+      <div class="modal-content" style="max-width:320px;">
+        <h3>🧮 计算器</h3>
+        <div id="calcDisplay" style="background:#f5f5f5;padding:12px;border-radius:6px;text-align:right;font-size:1.4rem;margin-bottom:12px;min-height:40px;">0</div>
+        <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;">
+          <button class="calc-key" data-action="clear" style="padding:12px;border:1px solid #ddd;border-radius:6px;background:#fff;cursor:pointer;">C</button>
+          <button class="calc-key" data-action="delete" style="padding:12px;border:1px solid #ddd;border-radius:6px;background:#fff;cursor:pointer;">⌫</button>
+          <button class="calc-key" data-op="/" style="padding:12px;border:1px solid #ddd;border-radius:6px;background:#fff;cursor:pointer;">÷</button>
+          <button class="calc-key" data-op="*" style="padding:12px;border:1px solid #ddd;border-radius:6px;background:#fff;cursor:pointer;">×</button>
+          <button class="calc-key" data-num="7" style="padding:12px;border:1px solid #ddd;border-radius:6px;background:#fff;cursor:pointer;">7</button>
+          <button class="calc-key" data-num="8" style="padding:12px;border:1px solid #ddd;border-radius:6px;background:#fff;cursor:pointer;">8</button>
+          <button class="calc-key" data-num="9" style="padding:12px;border:1px solid #ddd;border-radius:6px;background:#fff;cursor:pointer;">9</button>
+          <button class="calc-key" data-op="-" style="padding:12px;border:1px solid #ddd;border-radius:6px;background:#fff;cursor:pointer;">-</button>
+          <button class="calc-key" data-num="4" style="padding:12px;border:1px solid #ddd;border-radius:6px;background:#fff;cursor:pointer;">4</button>
+          <button class="calc-key" data-num="5" style="padding:12px;border:1px solid #ddd;border-radius:6px;background:#fff;cursor:pointer;">5</button>
+          <button class="calc-key" data-num="6" style="padding:12px;border:1px solid #ddd;border-radius:6px;background:#fff;cursor:pointer;">6</button>
+          <button class="calc-key" data-op="+" style="padding:12px;border:1px solid #ddd;border-radius:6px;background:#fff;cursor:pointer;">+</button>
+          <button class="calc-key" data-num="1" style="padding:12px;border:1px solid #ddd;border-radius:6px;background:#fff;cursor:pointer;">1</button>
+          <button class="calc-key" data-num="2" style="padding:12px;border:1px solid #ddd;border-radius:6px;background:#fff;cursor:pointer;">2</button>
+          <button class="calc-key" data-num="3" style="padding:12px;border:1px solid #ddd;border-radius:6px;background:#fff;cursor:pointer;">3</button>
+          <button class="calc-key" data-action="equals" style="padding:12px;border:1px solid #ddd;border-radius:6px;background:#2d6a4f;color:#fff;cursor:pointer;grid-row:span 2;">=</button>
+          <button class="calc-key" data-num="0" style="padding:12px;border:1px solid #ddd;border-radius:6px;background:#fff;cursor:pointer;grid-column:span 2;">0</button>
+          <button class="calc-key" data-num="." style="padding:12px;border:1px solid #ddd;border-radius:6px;background:#fff;cursor:pointer;">.</button>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(calcModal);
+  }
+
+  if (calcBtn && calcModal) {
+    calcBtn.addEventListener('click', () => {
+      calcModal.style.display = 'flex';
+    });
+
+    calcModal.addEventListener('click', (e) => {
+      if (e.target === calcModal) calcModal.style.display = 'none';
+    });
+
+    const calcDisplay = calcModal.querySelector('#calcDisplay');
+    let calcExpression = '';
+    let shouldReset = false;
+
+    calcModal.querySelectorAll('.calc-key').forEach(key => {
+      key.addEventListener('click', () => {
+        const num = key.dataset.num;
+        const op = key.dataset.op;
+        const action = key.dataset.action;
+
+        if (num !== undefined) {
+          if (shouldReset) { calcExpression = num; shouldReset = false; }
+          else {
+            if (num === '.' && calcExpression.split(/[+\-*/]/).pop().includes('.')) return;
+            calcExpression += num;
+          }
+          calcDisplay.textContent = calcExpression || '0';
+        } else if (op !== undefined) {
+          if (calcExpression && !/[+\-*/]$/.test(calcExpression)) {
+            calcExpression += op;
+            shouldReset = false;
+            calcDisplay.textContent = calcExpression;
+          }
+        } else if (action === 'clear') {
+          calcExpression = '';
+          shouldReset = false;
+          calcDisplay.textContent = '0';
+        } else if (action === 'delete') {
+          calcExpression = calcExpression.slice(0, -1);
+          calcDisplay.textContent = calcExpression || '0';
+        } else if (action === 'equals') {
+          if (calcExpression && !/[+\-*/]$/.test(calcExpression)) {
+            try {
+              const sanitized = calcExpression.replace(/[^0-9+\-*/.]/g, '');
+              let result = Function('"use strict"; return (' + sanitized + ')')();
+              if (typeof result === 'number') {
+                if (!isFinite(result)) {
+                  calcDisplay.textContent = 'Error';
+                } else {
+                  result = Math.round(result * 100000000) / 100000000;
+                  calcDisplay.textContent = result;
+                }
+              }
+              calcExpression = String(result);
+              shouldReset = true;
+            } catch (e) {
+              calcDisplay.textContent = 'Error';
+              calcExpression = '';
+            }
+          }
+        }
+      });
+    });
+  }
+}
+
+// ==================== 全局密码设置 ====================
+function initGlobalPassword() {
+  let setPasswordBtn = document.getElementById('setPasswordBtn');
+  let setPasswordModal = document.getElementById('setPasswordModal');
+
+  if (!setPasswordBtn) {
+    const sidebar = document.querySelector('.sidebar');
+    if (sidebar) {
+      setPasswordBtn = document.createElement('button');
+      setPasswordBtn.id = 'setPasswordBtn';
+      setPasswordBtn.className = 'btn btn-outline';
+      setPasswordBtn.style.cssText = 'width:100%;margin-top:8px;';
+      setPasswordBtn.textContent = '🔐 设置密码';
+      sidebar.appendChild(setPasswordBtn);
+    }
+  }
+
+  if (!setPasswordModal) {
+    setPasswordModal = document.createElement('div');
+    setPasswordModal.id = 'setPasswordModal';
+    setPasswordModal.className = 'modal';
+    setPasswordModal.style.cssText = 'display:none;align-items:center;justify-content:center;';
+    setPasswordModal.innerHTML = `
+      <div class="modal-content" style="max-width:360px;">
+        <h3>🔐 设置全局密码</h3>
+        <div id="oldPasswordGroup" style="margin-bottom:12px;">
+          <label style="display:block;margin-bottom:4px;font-size:0.85rem;color:#666;">原密码</label>
+          <input type="password" id="oldPasswordInput" class="form-input" placeholder="输入原密码" style="width:100%;padding:8px;border:1px solid #ddd;border-radius:6px;">
+        </div>
+        <div style="margin-bottom:12px;">
+          <label style="display:block;margin-bottom:4px;font-size:0.85rem;color:#666;">新密码</label>
+          <input type="password" id="newPasswordInput" class="form-input" placeholder="输入新密码" style="width:100%;padding:8px;border:1px solid #ddd;border-radius:6px;">
+        </div>
+        <div style="margin-bottom:16px;">
+          <label style="display:block;margin-bottom:4px;font-size:0.85rem;color:#666;">确认新密码</label>
+          <input type="password" id="confirmNewPasswordInput" class="form-input" placeholder="再次输入新密码" style="width:100%;padding:8px;border:1px solid #ddd;border-radius:6px;">
+        </div>
+        <div class="modal-actions">
+          <button class="btn btn-secondary" id="cancelSetPasswordBtn">取消</button>
+          <button class="btn btn-primary" id="savePasswordBtn">保存</button>
+          <button class="btn btn-danger" id="removePasswordBtn" style="display:none;">取消密码</button>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(setPasswordModal);
+  }
+
+  if (setPasswordBtn && setPasswordModal) {
+    setPasswordBtn.addEventListener('click', () => {
+      const existingHash = AppState.globalPasswordHash;
+      const oldGroup = document.getElementById('oldPasswordGroup');
+      const removeBtn = document.getElementById('removePasswordBtn');
+      const modalTitle = setPasswordModal.querySelector('h3');
+
+      if (existingHash) {
+        if (modalTitle) modalTitle.textContent = '🔐 修改全局密码';
+        if (oldGroup) oldGroup.style.display = 'block';
+        if (removeBtn) removeBtn.style.display = 'inline-block';
+      } else {
+        if (modalTitle) modalTitle.textContent = '🔐 设置全局密码';
+        if (oldGroup) oldGroup.style.display = 'none';
+        if (removeBtn) removeBtn.style.display = 'none';
+      }
+
+      const oldInput = document.getElementById('oldPasswordInput');
+      const newInput = document.getElementById('newPasswordInput');
+      const confirmInput = document.getElementById('confirmNewPasswordInput');
+      if (oldInput) oldInput.value = '';
+      if (newInput) newInput.value = '';
+      if (confirmInput) confirmInput.value = '';
+
+      setPasswordModal.style.display = 'flex';
+    });
+
+    document.getElementById('cancelSetPasswordBtn').addEventListener('click', () => {
+      setPasswordModal.style.display = 'none';
+    });
+
+    document.getElementById('savePasswordBtn').addEventListener('click', async () => {
+      const oldInput = document.getElementById('oldPasswordInput');
+      const newInput = document.getElementById('newPasswordInput');
+      const confirmInput = document.getElementById('confirmNewPasswordInput');
+      const oldPwd = oldInput ? oldInput.value : '';
+      const pwd = newInput ? newInput.value : '';
+      const confirm = confirmInput ? confirmInput.value : '';
+
+      if (AppState.globalPasswordHash && oldPwd) {
+        const oldHash = await CryptoHelper.hashPassword(oldPwd);
+        if (oldHash !== AppState.globalPasswordHash) {
+          showToast('原密码错误', 'error');
+          return;
+        }
+      }
+      if (!pwd) { showToast('密码不能为空', 'error'); return; }
+      if (pwd !== confirm) { showToast('两次密码不一致', 'error'); return; }
+
+      const hash = await CryptoHelper.hashPassword(pwd);
+      AppState.globalPasswordHash = hash;
+      localStorage.setItem('fangkong_global_password_hash', hash);
+      setPasswordModal.style.display = 'none';
+      showToast('密码已设置');
+    });
+
+    document.getElementById('removePasswordBtn').addEventListener('click', async () => {
+      const oldInput = document.getElementById('oldPasswordInput');
+      const oldPwd = oldInput ? oldInput.value : '';
+      if (AppState.globalPasswordHash && oldPwd) {
+        const oldHash = await CryptoHelper.hashPassword(oldPwd);
+        if (oldHash !== AppState.globalPasswordHash) {
+          showToast('原密码错误', 'error');
+          return;
+        }
+      }
+      AppState.globalPasswordHash = null;
+      localStorage.removeItem('fangkong_global_password_hash');
+      setPasswordModal.style.display = 'none';
+      showToast('密码已取消');
+    });
+  }
+
+  // 加载已保存的密码 hash
+  const savedHash = localStorage.getItem('fangkong_global_password_hash');
+  if (savedHash) AppState.globalPasswordHash = savedHash;
+}
+
+// ==================== WebDAV 功能 ====================
+function openWebDAVModal() {
+  const config = Storage.getWebDAVConfig();
+
+  if (config) {
+    DOM.webdavUrl.value = config.url || '';
+    DOM.webdavUsername.value = config.username || '';
+    DOM.webdavPassword.value = config.password || '';
+    DOM.webdavPath.value = config.path || '/fangkong';
+    DOM.disconnectWebDAVBtn.style.display = 'inline-block';
+  } else {
+    DOM.webdavUrl.value = '';
+    DOM.webdavUsername.value = '';
+    DOM.webdavPassword.value = '';
+    DOM.webdavPath.value = '/fangkong';
+    DOM.disconnectWebDAVBtn.style.display = 'none';
+  }
+
+  DOM.webdavModal.style.display = 'flex';
+}
+
+function closeWebDAVModal() {
+  DOM.webdavModal.style.display = 'none';
+}
+
+async function testWebDAV() {
+  const config = {
+    url: DOM.webdavUrl.value.trim(),
+    username: DOM.webdavUsername.value.trim(),
+    password: DOM.webdavPassword.value,
+    path: DOM.webdavPath.value.trim() || '/fangkong'
+  };
+
+  if (!config.url || !config.username || !config.password) {
+    showToast('请填写完整的配置信息', 'error');
+    return;
+  }
+
+  DOM.testWebDAVBtn.textContent = '测试中...';
+  DOM.testWebDAVBtn.disabled = true;
+
+  const client = new WebDAVClient(config);
+  const result = await client.test();
+
+  DOM.testWebDAVBtn.textContent = '测试连接';
+  DOM.testWebDAVBtn.disabled = false;
+
+  if (result.success) {
+    showToast('✅ 连接成功！');
+  } else {
+    showToast('❌ 连接失败：' + result.error, 'error');
+  }
+}
+
+function saveWebDAVConfig() {
+  const config = {
+    url: DOM.webdavUrl.value.trim(),
+    username: DOM.webdavUsername.value.trim(),
+    password: DOM.webdavPassword.value,
+    path: DOM.webdavPath.value.trim() || '/fangkong',
+    enabled: true
+  };
+
+  if (!config.url || !config.username || !config.password) {
+    showToast('请填写完整的配置信息', 'error');
+    return;
+  }
+
+  Storage.setWebDAVConfig(config);
+  updateSyncStatus(true);
+  closeWebDAVModal();
+
+  // 立即尝试同步
+  syncNow();
+}
+
+function disconnectWebDAV() {
+  showConfirmDialog('确定要断开 WebDAV 连接吗？本地数据将保留。').then(confirmed => {
+    if (!confirmed) return;
+    Storage.clearWebDAVConfig();
+    updateSyncStatus(false);
+    closeWebDAVModal();
+  });
+}
+
+async function syncNow() {
+  if (AppState.syncInProgress) return;
+
+  AppState.syncInProgress = true;
+  DOM.syncNowBtn.textContent = '🔄 同步中...';
+  DOM.syncNowBtn.disabled = true;
+
+  const result = await Storage.sync();
+
+  AppState.syncInProgress = false;
+  DOM.syncNowBtn.textContent = '🔄 立即同步';
+  DOM.syncNowBtn.disabled = false;
+
+  if (result.success) {
+    // 重新渲染当前视图
+    renderCurrentView();
+
+    // 显示同步结果
+    const syncStatus = document.getElementById('syncStatus');
+    const originalText = syncStatus.textContent;
+    syncStatus.textContent = `✅ ${result.message}`;
+    setTimeout(() => {
+      updateSyncStatus(true);
+    }, 3000);
+  } else {
+    showToast('同步失败：' + result.error, 'error');
+  }
+}
+
+async function resolveConflict(strategy) {
+  DOM.conflictModal.style.display = 'none';
+
+  let result;
+  switch (strategy) {
+    case 'local':
+      result = await Storage.forceUpload();
+      break;
+    case 'remote':
+      result = await Storage.forceDownload();
+      break;
+    case 'merge':
+      // 合并已经在 sync 方法中完成
+      result = { success: true };
+      break;
+  }
+
+  if (result.success) {
+    renderCurrentView();
+    showToast('已按选择处理冲突');
+  } else {
+    showToast('处理失败：' + result.error, 'error');
+  }
+}
+
+// ==================== 视图切换 ====================
+function switchView(viewName) {
+  AppState.currentView = viewName;
+
+  DOM.navItems.forEach(item => {
+    item.classList.toggle('active', item.dataset.view === viewName);
+  });
+
+  Object.keys(DOM.views).forEach(key => {
+    DOM.views[key].classList.toggle('active', key === viewName);
+  });
+
+  renderCurrentView();
+}
+
+function renderCurrentView() {
+  switch (AppState.currentView) {
+    case 'todo':
+      renderTodos();
+      break;
+    case 'notes':
+      renderNotes();
+      break;
+    case 'account':
+      renderAccounts();
+      break;
+    case 'calendar':
+      renderCalendar();
+      break;
+    case 'trash':
+      renderTrash();
+      break;
+  }
+}
+
+// ==================== 链接处理 ====================
+function extractLinks(text) {
+  if (!text) return [];
+  const urlRegex = /(https?:\/\/[^\s<]+[^\s.,;!?<])/gi;
+  return text.match(urlRegex) || [];
+}
+
+function linkifyText(text, linkTitles = {}) {
+  if (!text) return '';
+  const urlRegex = /(https?:\/\/[^\s<]+[^\s.,;!?<])/gi;
+  let result = escapeHtml(text);
+  const links = text.match(urlRegex) || [];
+  links.forEach(url => {
+    const title = linkTitles[url];
+    let replacement;
+    if (title && title !== url) {
+      replacement = `<span class="todo-link-item"><span class="todo-link-title">${escapeHtml(title)}</span><a href="${url}" class="todo-link" target="_blank" rel="noopener">${url}</a></span>`;
+    } else {
+      replacement = `<a href="${url}" class="todo-link" target="_blank" rel="noopener">${url}</a>`;
+    }
+    result = result.replace(escapeHtml(url), replacement);
+  });
+  return result;
+}
+
+// ==================== 待办功能 ====================
+function renderTodos() {
+  const todos = Storage.get(Storage.keys.todos);
+
+  // 过滤已删除的项目（兼容旧数据：检查 deleted 字段或 trash 中的记录）
+  let displayTodos = todos.filter(t => !t.deleted);
+
+  if (!AppState.showCompletedTodos) {
+    displayTodos = displayTodos.filter(t => !t.completed);
+  }
+
+  // 按提醒日期分组
+  const today = new Date();
+  const todayStr = `${today.getFullYear()}-${String(today.getMonth()+1).padStart(2,'0')}-${String(today.getDate()).padStart(2,'0')}`;
+
+  const pinnedTodos = displayTodos.filter(t => t.pinned);
+  const normalTodos = displayTodos.filter(t => !t.pinned);
+
+  const buckets = {};
+  normalTodos.forEach(t => {
+    let key = 'nodate';
+    if (t.reminder) {
+      const d = new Date(t.reminder);
+      key = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+    }
+    if (!buckets[key]) buckets[key] = [];
+    buckets[key].push(t);
+  });
+
+  const sortedKeys = Object.keys(buckets)
+    .filter(k => k !== 'nodate')
+    .sort()
+    .concat(buckets['nodate'] ? ['nodate'] : []);
+
+  const totalAll = displayTodos.length;
+  const undoneAll = displayTodos.filter(t => !t.completed).length;
+  DOM.todoCountBadge.textContent = `${undoneAll}/${totalAll}`;
+  DOM.todoList.innerHTML = '';
+
+  if (displayTodos.length === 0) {
+    DOM.todoList.innerHTML = `
+      <div class="empty-state">
+        <span class="icon">🌱</span>
+        <p>暂无待办事项，点击"新建任务"添加</p>
+      </div>
+    `;
+    return;
+  }
+
+  // 渲染置顶分组
+  if (pinnedTodos.length > 0) {
+    const pinHeader = document.createElement('li');
+    pinHeader.className = 'todo-group-header';
+    pinHeader.innerHTML = `📍 置顶`;
+    DOM.todoList.appendChild(pinHeader);
+    pinnedTodos.forEach(todo => DOM.todoList.appendChild(makeTodoLi(todo)));
+  }
+
+  // 渲染普通分组
+  sortedKeys.forEach(key => {
+    const group = buckets[key];
+    const isToday = (key === todayStr);
+    if (group.length === 0) return;
+
+    let headerText = '';
+    if (key === 'nodate') {
+      headerText = '📌 无提醒时间';
+    } else {
+      const [y, m, d] = key.split('-');
+      if (isToday) {
+        const undoneToday = group.filter(t => !t.completed).length;
+        const totalToday = group.length;
+        headerText = `📅 今天 ${y}/${m}/${d} <span class="group-count">${undoneToday}/${totalToday}</span>`;
+      } else {
+        headerText = `📅 ${y}/${m}/${d}`;
+      }
+    }
+
+    const header = document.createElement('li');
+    header.className = 'todo-group-header';
+    header.innerHTML = headerText;
+    DOM.todoList.appendChild(header);
+
+    group.forEach(todo => DOM.todoList.appendChild(makeTodoLi(todo)));
+  });
+}
+
+function makeTodoLi(todo) {
+  const li = document.createElement('li');
+  li.className = `todo-item ${todo.completed ? 'completed' : ''} ${AppState.todoBatchMode ? 'batch-mode' : ''}`;
+  li.dataset.id = todo.id;
+
+  let repeatText = '';
+  if (todo.repeat && todo.repeat !== 'never') {
+    const repeatLabels = { daily: '每天', workday: '工作日', weekly: '每周', monthly: '每月' };
+    repeatText = `<span style="color: #2d6a4f; font-size: 0.75rem;">🔄 ${repeatLabels[todo.repeat] || todo.repeat}</span>`;
+  }
+
+  let dueText = '';
+  if (todo.reminder) {
+    const daysLeft = Math.ceil((new Date(todo.reminder) - new Date()) / (1000 * 60 * 60 * 24));
+    const color = daysLeft < 0 ? '#e76f51' : daysLeft <= 3 ? '#f4a261' : '#5a6c5e';
+    const reminderDate = todo.reminder.split('T')[0];
+    dueText = `<span style="color: ${color}; font-size: 0.75rem;">📅 ${reminderDate} ${daysLeft < 0 ? '(已过期)' : daysLeft === 0 ? '(今天)' : '(' + daysLeft + '天后)'}</span>`;
+  }
+
+  let linkText = '';
+  if (todo.linkTitles && Object.keys(todo.linkTitles).length > 0) {
+    linkText = `<span style="color: #2a9d8f; font-size: 0.75rem;">🔗 ${Object.values(todo.linkTitles).join(', ')}</span>`;
+  }
+
+  const contentHtml = todo.content ? `<div class="todo-content-text">${linkifyText(todo.content, todo.linkTitles || {})}</div>` : '';
+
+  li.innerHTML = `
+    ${AppState.todoBatchMode ? `<label class="todo-checkbox-label"><input type="checkbox" class="batch-checkbox" data-id="${todo.id}" ${AppState.selectedTodos.has(todo.id) ? 'checked' : ''}></label>` : ''}
+    <input type="checkbox" class="todo-check" ${todo.completed ? 'checked' : ''} data-id="${todo.id}">
+    <div class="todo-content">
+      <div class="todo-title">${escapeHtml(todo.title)} ${todo.pinned ? '📍' : ''}</div>
+      ${contentHtml}
+      <div class="todo-reminder">${repeatText} ${dueText} ${linkText}</div>
+    </div>
+    ${!AppState.todoBatchMode ? `
+      <div class="todo-actions">
+        <span class="todo-edit" data-id="${todo.id}" title="编辑">✏️</span>
+        <span class="todo-delete" data-id="${todo.id}" title="删除">🗑️</span>
+      </div>
+    ` : ''}
+  `;
+
+  const checkbox = li.querySelector('.todo-check');
+  checkbox.addEventListener('change', () => toggleTodoComplete(todo.id));
+
+  if (!AppState.todoBatchMode) {
+    li.querySelector('.todo-edit').addEventListener('click', (e) => { e.stopPropagation(); openTodoModal(todo.id); });
+    li.querySelector('.todo-delete').addEventListener('click', (e) => { e.stopPropagation(); deleteTodo(todo.id); });
+    // 右键菜单
+    li.addEventListener('contextmenu', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      showTodoContextMenu(e, todo);
+    });
+    // 点击整行切换完成
+    li.addEventListener('click', (e) => {
+      if (e.target === li || e.target.classList.contains('todo-content') || e.target.classList.contains('todo-title')) {
+        toggleTodoComplete(todo.id);
+      }
+    });
+  } else {
+    li.querySelector('.batch-checkbox').addEventListener('change', (e) => {
+      if (e.target.checked) {
+        AppState.selectedTodos.add(todo.id);
+      } else {
+        AppState.selectedTodos.delete(todo.id);
+      }
+    });
+  }
+
+  return li;
+}
+
+function showTodoContextMenu(e, todo) {
+  let menu = document.getElementById('todoContextMenu');
+  if (!menu) {
+    menu = document.createElement('div');
+    menu.id = 'todoContextMenu';
+    menu.style.cssText = 'position:fixed;background:#fff;border:1px solid #e0e0e0;border-radius:8px;box-shadow:0 4px 16px rgba(0,0,0,0.15);z-index:99998;min-width:150px;padding:4px 0;display:none;';
+    document.body.appendChild(menu);
+    document.addEventListener('click', () => { if (menu) menu.style.display = 'none'; });
+    document.addEventListener('keydown', ev => { if (ev.key === 'Escape' && menu) menu.style.display = 'none'; });
+  }
+
+  const isPinned = !!todo.pinned;
+  menu.innerHTML = `
+    <div class="ctx-item ctx-edit" data-id="${todo.id}" style="padding:8px 16px;cursor:pointer;font-size:13px;display:flex;align-items:center;gap:8px;background:white;">✏️ 编辑</div>
+    <div class="ctx-item ctx-pin" data-id="${todo.id}" style="padding:8px 16px;cursor:pointer;font-size:13px;display:flex;align-items:center;gap:8px;background:white;">${isPinned ? '📌 取消置顶' : '📍 置顶'}</div>
+    <div style="height:1px;background:#f0f0f0;margin:2px 0;"></div>
+    <div class="ctx-item ctx-delete" data-id="${todo.id}" style="padding:8px 16px;cursor:pointer;font-size:13px;color:#bc6c25;display:flex;align-items:center;gap:8px;background:white;">🗑️ 删除</div>
+  `;
+
+  menu.querySelectorAll('.ctx-item').forEach(item => {
+    item.addEventListener('mouseenter', () => item.style.background = '#f0f0f0');
+    item.addEventListener('mouseleave', () => item.style.background = 'white');
+  });
+
+  menu.style.display = 'block';
+  menu.style.left = '-1000px';
+  menu.style.top = '-1000px';
+  const menuWidth = menu.offsetWidth;
+  const menuHeight = menu.offsetHeight;
+  const vw = window.innerWidth, vh = window.innerHeight;
+  let left = e.clientX + 2, top = e.clientY + 2;
+  if (left + menuWidth > vw) left = vw - menuWidth - 2;
+  if (top + menuHeight > vh) top = vh - menuHeight - 2;
+  menu.style.left = `${left}px`;
+  menu.style.top = `${top}px`;
+
+  menu.querySelector('.ctx-edit').addEventListener('click', (ev) => {
+    ev.stopPropagation();
+    menu.style.display = 'none';
+    openTodoModal(todo.id);
+  });
+  menu.querySelector('.ctx-pin').addEventListener('click', (ev) => {
+    ev.stopPropagation();
+    menu.style.display = 'none';
+    const todos = Storage.get(Storage.keys.todos);
+    const t = todos.find(x => x.id === todo.id);
+    if (t) { t.pinned = !t.pinned; t.updated_at = new Date().toISOString(); Storage.set(Storage.keys.todos, todos); renderTodos(); }
+    showToast(t.pinned ? '已置顶' : '已取消置顶');
+  });
+  menu.querySelector('.ctx-delete').addEventListener('click', (ev) => {
+    ev.stopPropagation();
+    menu.style.display = 'none';
+    deleteTodo(todo.id);
+  });
+}
+
+function openTodoModal(todoId = null) {
+  AppState.editingTodoId = todoId;
+  DOM.todoModalTitle.textContent = todoId ? '编辑待办' : '新建待办';
+
+  if (todoId) {
+    const todos = Storage.get(Storage.keys.todos);
+    const todo = todos.find(t => t.id === todoId);
+    if (todo) {
+      DOM.todoTitleInput.value = todo.title || '';
+      DOM.todoDescInput.value = todo.content || '';
+      DOM.todoDueDate.value = todo.reminder ? todo.reminder.slice(0, 16) : '';
+      DOM.todoReminderOffset.value = String(todo.reminderOffset || 0);
+      DOM.todoRepeatSelect.value = todo.repeat || 'never';
+      DOM.todoRepeatDays.value = String(todo.repeatDays || 30);
+    }
+  } else {
+    DOM.todoTitleInput.value = '';
+    DOM.todoDescInput.value = '';
+    DOM.todoDueDate.value = '';
+    DOM.todoReminderOffset.value = '0';
+    DOM.todoRepeatSelect.value = 'never';
+    DOM.todoRepeatDays.value = '30';
+  }
+
+  toggleRepeatFreq();
+  DOM.todoModal.style.display = 'flex';
+}
+
+function closeTodoModal() {
+  DOM.todoModal.style.display = 'none';
+  AppState.editingTodoId = null;
+}
+
+function toggleRepeatFreq() {
+  DOM.repeatDaysRow.style.display = DOM.todoRepeatSelect.value === 'never' ? 'none' : 'block';
+}
+
+async function saveTodo() {
+  const title = DOM.todoTitleInput.value.trim();
+  if (!title) {
+    showToast('请输入待办标题', 'error');
+    return;
+  }
+
+  const todos = Storage.get(Storage.keys.todos);
+  const content = DOM.todoDescInput.value.trim();
+  const dateVal = DOM.todoDueDate.value;
+  const reminder = dateVal ? new Date(dateVal).toISOString() : '';
+  const reminderOffset = parseInt(DOM.todoReminderOffset.value) || 0;
+  const repeat = DOM.todoRepeatSelect.value || 'never';
+  const repeatDays = repeat === 'never' ? 0 : (parseInt(DOM.todoRepeatDays.value) || 30);
+
+  // 提取链接
+  const links = extractLinks(content);
+  const linkTitles = {};
+  links.forEach(url => { linkTitles[url] = url; });
+
+  const now = new Date().toISOString();
+  let parentId = AppState.editingTodoId;
+
+  if (AppState.editingTodoId) {
+    const index = todos.findIndex(t => t.id === AppState.editingTodoId);
+    if (index !== -1) {
+      todos[index] = {
+        ...todos[index],
+        title,
+        content,
+        reminder,
+        reminderOffset,
+        repeat,
+        repeatDays,
+        linkTitles,
+        updated_at: now
+      };
+    }
+  } else {
+    parentId = generateId();
+    todos.push({
+      id: parentId,
+      title,
+      content,
+      reminder,
+      reminderOffset,
+      repeat,
+      repeatDays,
+      completed: false,
+      pinned: false,
+      linkTitles,
+      created_at: now,
+      updated_at: now
+    });
+  }
+
+  Storage.set(Storage.keys.todos, todos);
+
+  // 生成循环子任务
+  if (repeat !== 'never' && repeatDays > 0 && reminder && parentId) {
+    generateRepeatTodos(parentId, title, content, reminder, reminderOffset, repeat, repeatDays);
+  }
+
+  // 如果有 WebDAV，自动同步
+  if (Storage.webdav && !AppState.syncInProgress) {
+    await Storage.sync();
+  }
+
+  closeTodoModal();
+  renderTodos();
+}
+
+function generateRepeatTodos(parentId, title, content, baseReminderIso, offset, repeat, repeatDays) {
+  const baseDate = new Date(baseReminderIso);
+  const limitDate = new Date(baseDate.getTime() + repeatDays * 24 * 60 * 60 * 1000);
+  const MAX_INSTANCES = 999;
+  const todos = Storage.get(Storage.keys.todos);
+
+  // 删除旧的未完成的子任务
+  const childTodos = todos.filter(t =>
+    t.repeatParentId === String(parentId) && !t.completed && t.id !== parentId
+  );
+  childTodos.forEach(ct => {
+    const idx = todos.findIndex(t => t.id === ct.id);
+    if (idx !== -1) todos.splice(idx, 1);
+  });
+
+  const dates = [];
+  let i = 1;
+  while (true) {
+    const d = new Date(baseDate);
+    if (repeat === 'daily') {
+      d.setDate(d.getDate() + i);
+    } else if (repeat === 'workday') {
+      let count = 0;
+      const cursor = new Date(baseDate);
+      while (count < i) {
+        cursor.setDate(cursor.getDate() + 1);
+        const dow = cursor.getDay();
+        if (dow !== 0 && dow !== 6) count++;
+      }
+      if (cursor > limitDate) break;
+      dates.push(new Date(cursor));
+      i++;
+      continue;
+    } else if (repeat === 'weekly') {
+      d.setDate(d.getDate() + 7 * i);
+    } else if (repeat === 'monthly') {
+      d.setMonth(d.getMonth() + i);
+      const targetMonth = (baseDate.getMonth() + i) % 12;
+      if (d.getMonth() !== targetMonth) d.setDate(0);
+    }
+
+    if (d > limitDate) break;
+    if (i > MAX_INSTANCES) break;
+    dates.push(d);
+    i++;
+  }
+
+  dates.forEach(dt => {
+    todos.push({
+      id: generateId(),
+      title,
+      content,
+      reminder: dt.toISOString(),
+      reminderOffset: offset,
+      repeat: 'never',
+      repeatDays: 0,
+      completed: false,
+      pinned: false,
+      linkTitles: {},
+      repeatParentId: String(parentId),
+      created_at: dt.toISOString(),
+      updated_at: dt.toISOString()
+    });
+  });
+
+  Storage.set(Storage.keys.todos, todos);
+}
+
+function toggleTodoComplete(id) {
+  const todos = Storage.get(Storage.keys.todos);
+  const todo = todos.find(t => t.id === id);
+  if (todo) {
+    todo.completed = !todo.completed;
+    todo.updated_at = new Date().toISOString();
+    Storage.set(Storage.keys.todos, todos);
+    renderTodos();
+  }
+}
+
+function deleteTodo(id) {
+  showConfirmDialog('确定要删除这个待办吗？删除后可在回收站恢复。').then(confirmed => {
+    if (!confirmed) return;
+    const todos = Storage.get(Storage.keys.todos);
+    const todo = todos.find(t => t.id === id);
+
+    if (todo) {
+      todo.deleted = 1;
+      todo.updated_at = new Date().toISOString();
+      Storage.set(Storage.keys.todos, todos);
+      renderTodos();
+      showToast('已删除，可在回收站恢复');
+    }
+  });
+}
+
+function toggleShowCompleted() {
+  AppState.showCompletedTodos = !AppState.showCompletedTodos;
+  DOM.toggleShowCompleted.textContent = AppState.showCompletedTodos ? '📋 隐藏已完成' : '📋 显示已完成';
+  renderTodos();
+}
+
+function toggleTodoBatchMode() {
+  AppState.todoBatchMode = !AppState.todoBatchMode;
+  AppState.selectedTodos.clear();
+
+  if (AppState.todoBatchMode) {
+    DOM.batchSelectTodosBtn.style.display = 'none';
+    DOM.selectAllTodosBtn.style.display = 'inline-block';
+    DOM.batchDeleteTodosBtn.style.display = 'inline-block';
+  } else {
+    DOM.batchSelectTodosBtn.style.display = 'inline-block';
+    DOM.selectAllTodosBtn.style.display = 'none';
+    DOM.batchDeleteTodosBtn.style.display = 'none';
+  }
+
+  renderTodos();
+}
+
+function selectAllTodos() {
+  const todos = Storage.get(Storage.keys.todos);
+  let displayTodos = todos.filter(t => !t.deleted);
+
+  if (!AppState.showCompletedTodos) {
+    displayTodos = displayTodos.filter(t => !t.completed);
+  }
+
+  if (AppState.selectedTodos.size === displayTodos.length) {
+    AppState.selectedTodos.clear();
+  } else {
+    displayTodos.forEach(t => AppState.selectedTodos.add(t.id));
+  }
+
+  renderTodos();
+}
+
+function batchDeleteTodos() {
+  if (AppState.selectedTodos.size === 0) {
+    showToast('请先选择要删除的待办', 'error');
+    return;
+  }
+
+  showConfirmDialog(`确定要删除选中的 ${AppState.selectedTodos.size} 个待办吗？`).then(confirmed => {
+    if (!confirmed) return;
+
+    const todos = Storage.get(Storage.keys.todos);
+    const now = new Date().toISOString();
+
+    AppState.selectedTodos.forEach(id => {
+      const todo = todos.find(t => t.id === id);
+      if (todo) {
+        todo.deleted = 1;
+        todo.updated_at = now;
+      }
+    });
+
+    Storage.set(Storage.keys.todos, todos);
+
+    AppState.selectedTodos.clear();
+    toggleTodoBatchMode();
+    renderTodos();
+    showToast('已删除，可在回收站恢复');
+  });
+}
+
+// ==================== 笔记功能 ====================
+function renderNotes() {
+  const notes = Storage.get(Storage.keys.notes);
+
+  // 过滤已删除的项目
+  let displayNotes = notes.filter(n => !n.deleted);
+
+  if (AppState.notesSearchKeyword) {
+    const keyword = AppState.notesSearchKeyword.toLowerCase();
+    displayNotes = displayNotes.filter(n =>
+      (n.title && n.title.toLowerCase().includes(keyword)) ||
+      (n.content && n.content.toLowerCase().includes(keyword))
+    );
+  }
+
+  // 置顶优先，再按创建时间降序
+  displayNotes.sort((a, b) => {
+    if (a.is_pinned && !b.is_pinned) return -1;
+    if (!a.is_pinned && b.is_pinned) return 1;
+    return new Date(b.created_at) - new Date(a.created_at);
+  });
+
+  const noteCountBadge = document.getElementById('noteCountBadge');
+  if (noteCountBadge) {
+    const searchHint = AppState.notesSearchKeyword.trim() ? ` (搜索到 ${displayNotes.length} 条)` : '';
+    noteCountBadge.textContent = notes.length ? `共 ${notes.length} 篇${searchHint}` : '';
+  }
+
+  DOM.notesList.innerHTML = '';
+
+  if (displayNotes.length === 0) {
+    DOM.notesList.innerHTML = `
+      <div class="empty-state" style="grid-column: 1 / -1;">
+        <span class="icon">📝</span>
+        <p>${AppState.notesSearchKeyword ? '没有找到匹配的笔记' : '暂无笔记，点击"新建笔记"添加'}</p>
+      </div>
+    `;
+    return;
+  }
+
+  // 按创建日期分组
+  const noteBuckets = {};
+  displayNotes.forEach(note => {
+    const d = new Date(note.created_at);
+    const key = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+    if (!noteBuckets[key]) noteBuckets[key] = [];
+    noteBuckets[key].push(note);
+  });
+
+  const sortedNoteKeys = Object.keys(noteBuckets).sort().reverse();
+
+  sortedNoteKeys.forEach(key => {
+    const group = noteBuckets[key];
+    const [y, m, d] = key.split('-');
+
+    const groupHeader = document.createElement('div');
+    groupHeader.className = 'note-group-header';
+    groupHeader.textContent = `📅 ${y}/${m}/${d}`;
+    DOM.notesList.appendChild(groupHeader);
+
+    group.forEach(note => {
+      const card = makeNoteCard(note);
+      DOM.notesList.appendChild(card);
+    });
+  });
+}
+
+function makeNoteCard(note) {
+  const card = document.createElement('div');
+  card.className = `note-card ${note.is_pinned ? 'pinned' : ''}`;
+
+  const titleRaw = note.title || '无标题';
+  const pinIcon = note.is_pinned ? '📌 ' : '';
+  const lockIcon = note.is_protected ? '🔒 ' : '';
+
+  let previewRaw;
+  if (note.is_encrypted) {
+    previewRaw = '🔒 已加密';
+  } else {
+    previewRaw = (note.content || '').replace(/<[^>]*>/g, '').substring(0, 100);
+  }
+
+  const searchKw = AppState.notesSearchKeyword.trim();
+  const title = searchKw ? highlightKeyword(titleRaw, searchKw) : escapeHtml(titleRaw);
+  const preview = searchKw && !note.is_encrypted ? highlightKeyword(previewRaw, searchKw) : escapeHtml(previewRaw);
+
+  const checkboxHtml = AppState.noteBatchMode ?
+    `<div style="position: absolute; top: 10px; right: 10px;">
+      <input type="checkbox" class="note-batch-checkbox" data-note-id="${note.id}" ${AppState.selectedNotes.has(note.id) ? 'checked' : ''}>
+    </div>` : '';
+
+  card.innerHTML = `
+    ${checkboxHtml}
+    <div class="note-title" style="font-weight: 600; margin-bottom: 8px;">${pinIcon}${lockIcon}${title}</div>
+    <div class="note-preview" style="font-size: 0.85rem; color: #666;">${preview}${previewRaw.length > 100 ? '...' : ''}</div>
+    <div style="font-size: 0.75rem; color: #999; margin-top: 8px;">${formatDateTime(note.created_at)}</div>
+  `;
+  card.style.position = 'relative';
+
+  if (AppState.noteBatchMode) {
+    card.addEventListener('click', (e) => {
+      if (e.target.classList.contains('note-batch-checkbox')) {
+        const noteId = e.target.dataset.noteId;
+        if (e.target.checked) { AppState.selectedNotes.add(noteId); card.classList.add('selected'); }
+        else { AppState.selectedNotes.delete(noteId); card.classList.remove('selected'); }
+      } else {
+        const checkbox = card.querySelector('.note-batch-checkbox');
+        if (checkbox) {
+          checkbox.checked = !checkbox.checked;
+          const noteId = note.id;
+          if (checkbox.checked) { AppState.selectedNotes.add(noteId); card.classList.add('selected'); }
+          else { AppState.selectedNotes.delete(noteId); card.classList.remove('selected'); }
+        }
+      }
+    });
+  } else {
+    card.addEventListener('click', () => openNoteEditor(note.id));
+  }
+
+  // 右键菜单
+  card.addEventListener('contextmenu', (e) => {
+    e.preventDefault();
+    showNoteContextMenu(e, note);
+  });
+
+  return card;
+}
+
+function showNoteContextMenu(e, note) {
+  let menu = document.getElementById('noteCardContextMenu');
+  if (!menu) {
+    menu = document.createElement('div');
+    menu.id = 'noteCardContextMenu';
+    menu.style.cssText = 'position:fixed;background:#fff;border:1px solid #ccc;border-radius:6px;box-shadow:0 4px 12px rgba(0,0,0,0.15);z-index:99999;min-width:140px;padding:4px 0;display:none;';
+    document.body.appendChild(menu);
+    document.addEventListener('click', (ev) => { if (!menu.contains(ev.target)) menu.style.display = 'none'; });
+  }
+
+  const isPinned = note.is_pinned ? 1 : 0;
+  menu.innerHTML = `
+    <div class="ctx-item" data-action="togglePin" data-note-id="${note.id}" style="padding:8px 16px;cursor:pointer;font-size:0.9rem;" onmouseover="this.style.background='#f0f0f0'" onmouseout="this.style.background=''">${isPinned ? '📍 取消置顶' : '📌 置顶'}</div>
+    <div class="ctx-item" data-action="openNote" data-note-id="${note.id}" style="padding:8px 16px;cursor:pointer;font-size:0.9rem;" onmouseover="this.style.background='#f0f0f0'" onmouseout="this.style.background=''">📖 打开笔记</div>
+    <div style="border-top:1px solid #eee;margin:4px 0;"></div>
+    <div class="ctx-item" data-action="deleteNote" data-note-id="${note.id}" style="padding:8px 16px;cursor:pointer;font-size:0.9rem;color:#dc3545;" onmouseover="this.style.background='#fff0f0'" onmouseout="this.style.background=''">🗑️ 删除</div>
+  `;
+
+  menu.querySelectorAll('.ctx-item').forEach(item => {
+    item.addEventListener('click', (ev) => {
+      const action = ev.target.dataset.action;
+      const noteId = ev.target.dataset.noteId;
+      menu.style.display = 'none';
+
+      if (action === 'togglePin') {
+        const notes = Storage.get(Storage.keys.notes);
+        const n = notes.find(x => x.id === noteId);
+        if (n) { n.is_pinned = !n.is_pinned; n.updated_at = new Date().toISOString(); Storage.set(Storage.keys.notes, notes); renderNotes(); }
+      } else if (action === 'openNote') {
+        openNoteEditor(noteId);
+      } else if (action === 'deleteNote') {
+        deleteNoteById(noteId);
+      }
+    });
+  });
+
+  menu.style.left = e.clientX + 'px';
+  menu.style.top = e.clientY + 'px';
+  menu.style.display = 'block';
+}
+
+function highlightKeyword(text, keyword) {
+  if (!keyword || !keyword.trim() || !text) return escapeHtml(text);
+  const kw = keyword.trim();
+  const regex = new RegExp(`(${kw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})`, 'gi');
+  return escapeHtml(text).replace(regex, '<span style="background:#ffd700;color:#333;padding:0 2px;border-radius:2px;">$1</span>');
+}
+
+function openNoteEditor(noteId = null) {
+  AppState.editingNoteId = noteId;
+
+  if (noteId) {
+    const notes = Storage.get(Storage.keys.notes);
+    const note = notes.find(n => n.id === noteId);
+    if (note) {
+      DOM.noteMeta.textContent = `📝 ${note.title || '无标题'} - ${formatDateTime(note.updated_at)}`;
+      updatePinButton(note);
+      updateEncryptButton(note);
+
+      if (note.is_encrypted) {
+        // 加密笔记：先显示占位符，需要密码才能查看
+        DOM.noteEditor.value = '🔒 此笔记已加密，点击「解密」按钮输入密码查看';
+        DOM.noteEditor.readOnly = true;
+        DOM.toggleEditBtn.style.display = 'none';
+      } else {
+        DOM.noteEditor.value = note.content || '';
+        DOM.noteEditor.readOnly = true;
+        DOM.toggleEditBtn.textContent = '✏️ 编辑';
+        DOM.toggleEditBtn.style.display = 'inline-block';
+      }
+    }
+  } else {
+    DOM.noteMeta.textContent = '📝 新建笔记';
+    DOM.noteEditor.value = '';
+    DOM.noteEditor.readOnly = false;
+    DOM.toggleEditBtn.textContent = '✏️ 编辑';
+    DOM.toggleEditBtn.style.display = 'inline-block';
+    DOM.togglePinNoteBtn.style.display = 'none';
+    DOM.toggleEncryptBtn.style.display = 'none';
+  }
+
+  DOM.noteEditorPanel.style.display = 'block';
+  DOM.notesList.style.display = 'none';
+}
+
+function closeNoteEditor() {
+  DOM.noteEditorPanel.style.display = 'none';
+  DOM.notesList.style.display = 'grid';
+  AppState.editingNoteId = null;
+}
+
+async function saveNote() {
+  const notes = Storage.get(Storage.keys.notes);
+  const now = new Date().toISOString();
+
+  if (AppState.editingNoteId) {
+    const index = notes.findIndex(n => n.id === AppState.editingNoteId);
+    if (index !== -1) {
+      const note = notes[index];
+      // 如果笔记已加密，不要从编辑器获取内容（编辑器显示的是占位符）
+      let newContent = note.content;
+      let newTitle = note.title;
+      if (!note.is_encrypted) {
+        const content = DOM.noteEditor.value.trim();
+        newContent = content;
+        newTitle = content.split('\n')[0].substring(0, 50) || '无标题';
+      }
+      notes[index] = {
+        ...note,
+        title: newTitle,
+        content: newContent,
+        updated_at: now
+      };
+    }
+  } else {
+    const content = DOM.noteEditor.value.trim();
+    const title = content.split('\n')[0].substring(0, 50) || '无标题';
+    notes.push({
+      id: generateId(),
+      title,
+      content,
+      is_pinned: false,
+      is_protected: false,
+      is_encrypted: false,
+      created_at: now,
+      updated_at: now
+    });
+  }
+
+  Storage.set(Storage.keys.notes, notes);
+
+  // 如果有 WebDAV，自动同步
+  if (Storage.webdav && !AppState.syncInProgress) {
+    await Storage.sync();
+  }
+
+  DOM.saveIndicator.style.opacity = '1';
+  setTimeout(() => {
+    DOM.saveIndicator.style.opacity = '0';
+  }, 1500);
+
+  closeNoteEditor();
+  renderNotes();
+}
+
+function deleteCurrentNote() {
+  if (!AppState.editingNoteId) return;
+  deleteNoteById(AppState.editingNoteId);
+}
+
+function deleteNoteById(noteId) {
+  showConfirmDialog('确定要删除这个笔记吗？删除后可在回收站恢复。').then(confirmed => {
+    if (!confirmed) return;
+    const notes = Storage.get(Storage.keys.notes);
+    const note = notes.find(n => n.id === noteId);
+
+    if (note) {
+      note.deleted = 1;
+      note.updated_at = new Date().toISOString();
+      Storage.set(Storage.keys.notes, notes);
+
+      if (AppState.editingNoteId === noteId) {
+        closeNoteEditor();
+      }
+      renderNotes();
+      showToast('已删除，可在回收站恢复');
+    }
+  });
+}
+
+function toggleNoteEdit() {
+  if (!AppState.editingNoteId) return;
+  const notes = Storage.get(Storage.keys.notes);
+  const note = notes.find(n => n.id === AppState.editingNoteId);
+  if (note && note.is_encrypted) {
+    showToast('加密笔记需要先解密才能编辑', 'error');
+    return;
+  }
+
+  const isReadOnly = DOM.noteEditor.readOnly;
+  DOM.noteEditor.readOnly = !isReadOnly;
+  DOM.toggleEditBtn.textContent = isReadOnly ? '🔒 完成' : '✏️ 编辑';
+
+  if (!isReadOnly) {
+    saveNote();
+  }
+}
+
+function togglePinNote() {
+  if (!AppState.editingNoteId) return;
+  const notes = Storage.get(Storage.keys.notes);
+  const note = notes.find(n => n.id === AppState.editingNoteId);
+  if (!note) return;
+
+  note.is_pinned = !note.is_pinned;
+  note.updated_at = new Date().toISOString();
+  Storage.set(Storage.keys.notes, notes);
+  updatePinButton(note);
+}
+
+function updatePinButton(note) {
+  if (!note) return;
+  DOM.togglePinNoteBtn.textContent = note.is_pinned ? '📍 取消置顶' : '📌 置顶';
+  DOM.togglePinNoteBtn.style.display = 'inline-block';
+}
+
+function updateEncryptButton(note) {
+  if (!note) return;
+  DOM.toggleEncryptBtn.textContent = note.is_encrypted ? '🔓 解密' : '🔒 加密';
+  DOM.toggleEncryptBtn.style.display = 'inline-block';
+}
+
+async function toggleNoteEncrypt() {
+  if (!AppState.editingNoteId) return;
+  const notes = Storage.get(Storage.keys.notes);
+  const note = notes.find(n => n.id === AppState.editingNoteId);
+  if (!note) return;
+
+  if (note.is_encrypted) {
+    // 解密
+    const password = prompt('请输入解密密码');
+    if (!password) return;
+    try {
+      const decrypted = await CryptoHelper.decrypt(note.content, password);
+      note.content = decrypted;
+      note.is_encrypted = false;
+      note.is_protected = false;
+      note.updated_at = new Date().toISOString();
+      Storage.set(Storage.keys.notes, notes);
+      DOM.noteEditor.value = decrypted;
+      DOM.noteEditor.readOnly = true;
+      DOM.toggleEditBtn.textContent = '✏️ 编辑';
+      updateEncryptButton(note);
+      showToast('笔记已解密');
+    } catch (e) {
+      showToast('密码错误，无法解密', 'error');
+    }
+  } else {
+    // 加密
+    const password = prompt('请输入加密密码');
+    if (!password) return;
+    const confirmPassword = prompt('请再次输入密码确认');
+    if (password !== confirmPassword) {
+      showToast('两次密码不一致', 'error');
+      return;
+    }
+    try {
+      const content = DOM.noteEditor.value;
+      const encrypted = await CryptoHelper.encrypt(content, password);
+      note.content = encrypted;
+      note.is_encrypted = true;
+      note.is_protected = true;
+      note.updated_at = new Date().toISOString();
+      Storage.set(Storage.keys.notes, notes);
+      DOM.noteEditor.value = '🔒 此笔记已加密';
+      DOM.noteEditor.readOnly = true;
+      DOM.toggleEditBtn.textContent = '✏️ 编辑';
+      updateEncryptButton(note);
+      showToast('笔记已加密');
+    } catch (e) {
+      showToast('加密失败', 'error');
+    }
+  }
+}
+
+function searchNotes() {
+  AppState.notesSearchKeyword = DOM.notesSearchInput.value.trim();
+  DOM.clearSearchBtn.style.display = AppState.notesSearchKeyword ? 'block' : 'none';
+  renderNotes();
+}
+
+function clearSearch() {
+  DOM.notesSearchInput.value = '';
+  AppState.notesSearchKeyword = '';
+  DOM.clearSearchBtn.style.display = 'none';
+  renderNotes();
+}
+
+function toggleNoteBatchMode() {
+  AppState.noteBatchMode = !AppState.noteBatchMode;
+  AppState.selectedNotes.clear();
+
+  if (AppState.noteBatchMode) {
+    DOM.batchSelectNotesBtn.style.display = 'none';
+    DOM.selectAllNotesBtn.style.display = 'inline-block';
+    DOM.batchDeleteNotesBtn.style.display = 'inline-block';
+    DOM.addNoteBtn.style.display = 'none';
+  } else {
+    DOM.batchSelectNotesBtn.style.display = 'inline-block';
+    DOM.selectAllNotesBtn.style.display = 'none';
+    DOM.batchDeleteNotesBtn.style.display = 'none';
+    DOM.addNoteBtn.style.display = 'inline-block';
+  }
+
+  renderNotes();
+}
+
+function selectAllNotes() {
+  const notes = Storage.get(Storage.keys.notes);
+  let displayNotes = notes.filter(n => !n.deleted);
+
+  if (AppState.notesSearchKeyword) {
+    const keyword = AppState.notesSearchKeyword.toLowerCase();
+    displayNotes = displayNotes.filter(n =>
+      (n.title && n.title.toLowerCase().includes(keyword)) ||
+      (n.content && n.content.toLowerCase().includes(keyword))
+    );
+  }
+
+  if (AppState.selectedNotes.size === displayNotes.length) {
+    AppState.selectedNotes.clear();
+  } else {
+    displayNotes.forEach(n => AppState.selectedNotes.add(n.id));
+  }
+
+  renderNotes();
+}
+
+function batchDeleteNotes() {
+  if (AppState.selectedNotes.size === 0) {
+    showToast('请先选择要删除的笔记', 'error');
+    return;
+  }
+
+  showConfirmDialog(`确定要删除选中的 ${AppState.selectedNotes.size} 个笔记吗？`).then(confirmed => {
+    if (!confirmed) return;
+
+    const notes = Storage.get(Storage.keys.notes);
+    const now = new Date().toISOString();
+
+    AppState.selectedNotes.forEach(id => {
+      const note = notes.find(n => n.id === id);
+      if (note) {
+        note.deleted = 1;
+        note.updated_at = now;
+      }
+    });
+
+    Storage.set(Storage.keys.notes, notes);
+
+    AppState.selectedNotes.clear();
+    toggleNoteBatchMode();
+    renderNotes();
+    showToast('已删除，可在回收站恢复');
+  });
+}
+
+// ==================== 日历功能 ====================
+function initCalendar() {
+  const currentYear = new Date().getFullYear();
+  for (let year = currentYear - 10; year <= currentYear + 10; year++) {
+    const option = document.createElement('option');
+    option.value = year;
+    option.textContent = year;
+    DOM.yearSelect.appendChild(option);
+  }
+
+  for (let month = 1; month <= 12; month++) {
+    const option = document.createElement('option');
+    option.value = month;
+    option.textContent = month;
+    DOM.monthSelect.appendChild(option);
+  }
+}
+
+function renderCalendar() {
+  const year = AppState.currentMonth.getFullYear();
+  const month = AppState.currentMonth.getMonth() + 1;
+
+  DOM.yearSelect.value = year;
+  DOM.monthSelect.value = month;
+
+  DOM.calendarGrid.innerHTML = '';
+
+  const weekDays = ['日', '一', '二', '三', '四', '五', '六'];
+  weekDays.forEach(day => {
+    const header = document.createElement('div');
+    header.style.cssText = 'text-align: center; font-weight: 600; padding: 10px; color: #5a6c5e;';
+    header.textContent = day;
+    DOM.calendarGrid.appendChild(header);
+  });
+
+  const firstDay = new Date(year, month - 1, 1);
+  const lastDay = new Date(year, month, 0);
+  const startPadding = firstDay.getDay();
+  const daysInMonth = lastDay.getDate();
+
+  const prevMonthLastDay = new Date(year, month - 1, 0).getDate();
+  for (let i = startPadding - 1; i >= 0; i--) {
+    const dayDiv = createCalendarDay(year, month - 1, prevMonthLastDay - i, true);
+    DOM.calendarGrid.appendChild(dayDiv);
+  }
+
+  const today = new Date();
+  for (let day = 1; day <= daysInMonth; day++) {
+    const isToday = year === today.getFullYear() && month === today.getMonth() + 1 && day === today.getDate();
+    const dayDiv = createCalendarDay(year, month, day, false, isToday);
+    DOM.calendarGrid.appendChild(dayDiv);
+  }
+
+  const endPadding = (7 - ((startPadding + daysInMonth) % 7)) % 7;
+  for (let day = 1; day <= endPadding; day++) {
+    const dayDiv = createCalendarDay(year, month + 1, day, true);
+    DOM.calendarGrid.appendChild(dayDiv);
+  }
+}
+
+function createCalendarDay(year, month, day, isOtherMonth, isToday = false) {
+  const dayDiv = document.createElement('div');
+  dayDiv.className = `calendar-day ${isOtherMonth ? 'other-month' : ''} ${isToday ? 'today' : ''}`;
+
+  const dateInfo = getDateInfo(year, month, day);
+
+  const todos = Storage.get(Storage.keys.todos);
+  const notes = Storage.get(Storage.keys.notes);
+  const accounts = Storage.get(Storage.keys.accounts);
+  const dateStr = `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+
+  const dayTodos = todos.filter(t => {
+    if (t.deleted || !t.reminder) return false;
+    return t.reminder.split('T')[0] === dateStr && !t.completed;
+  });
+  const dayNotes = notes.filter(n => {
+    if (n.deleted || !n.created_at) return false;
+    return n.created_at.split('T')[0] === dateStr;
+  });
+  const dayAccounts = accounts.filter(a => a.date === dateStr);
+  const hasAccounts = dayAccounts.length > 0;
+
+  dayDiv.innerHTML = `
+    <div class="day-number">${day}</div>
+    <div class="day-lunar ${dateInfo.festival ? 'festival' : ''}">${dateInfo.festival || dateInfo.lunarStr}</div>
+    <div class="day-counts">
+      ${dayTodos.length > 0 ? `<span class="todo-count">☑️${dayTodos.length}</span>` : ''}
+      ${dayNotes.length > 0 ? `<span class="note-count">📝${dayNotes.length}</span>` : ''}
+      ${hasAccounts ? `<span class="account-count">💰</span>` : ''}
+    </div>
+  `;
+
+  dayDiv.addEventListener('click', () => showDayDetail(year, month, day));
+
+  return dayDiv;
+}
+
+function changeMonth(delta) {
+  AppState.currentMonth.setMonth(AppState.currentMonth.getMonth() + delta);
+  renderCalendar();
+}
+
+function goToToday() {
+  AppState.currentMonth = new Date();
+  renderCalendar();
+}
+
+function showDayDetail(year, month, day) {
+  const dateInfo = getDateInfo(year, month, day);
+  DOM.detailDate.textContent = `${year}年${month}月${day}日 ${dateInfo.weekDayStr} ${dateInfo.lunarStr}`;
+
+  const dateStr = `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+
+  const todos = Storage.get(Storage.keys.todos);
+  const dayTodos = todos.filter(t => !t.deleted && t.reminder && t.reminder.split('T')[0] === dateStr);
+
+  if (dayTodos.length > 0) {
+    if (DOM.dayTodosSection) DOM.dayTodosSection.style.display = 'block';
+    DOM.dayTodosList.innerHTML = dayTodos.map(t => `
+      <li style="padding: 8px; border-bottom: 1px solid #f0f0f0;">
+        <span style="${t.completed ? 'text-decoration: line-through; color: #999;' : ''}">${escapeHtml(t.title)}</span>
+        ${t.completed ? ' ✅' : ''}
+      </li>
+    `).join('');
+  } else {
+    if (DOM.dayTodosSection) DOM.dayTodosSection.style.display = 'none';
+  }
+
+  const notes = Storage.get(Storage.keys.notes);
+  const dayNotes = notes.filter(n => !n.deleted && n.created_at && n.created_at.split('T')[0] === dateStr);
+
+  if (dayNotes.length > 0) {
+    if (DOM.dayNotesSection) DOM.dayNotesSection.style.display = 'block';
+    DOM.dayNotesList.innerHTML = dayNotes.map(n => `
+      <li style="padding: 8px; border-bottom: 1px solid #f0f0f0;">
+        ${escapeHtml(n.title || '无标题')}
+      </li>
+    `).join('');
+  } else {
+    if (DOM.dayNotesSection) DOM.dayNotesSection.style.display = 'none';
+  }
+
+  // 显示当日记账
+  const accounts = Storage.get(Storage.keys.accounts);
+  const dayAccounts = accounts.filter(a => a.date === dateStr);
+  let accountSection = document.getElementById('dayAccountSection');
+  if (dayAccounts.length > 0) {
+    if (!accountSection) {
+      accountSection = document.createElement('div');
+      accountSection.id = 'dayAccountSection';
+      const modalContent = DOM.dayDetailModal.querySelector('.modal-content');
+      if (modalContent) modalContent.appendChild(accountSection);
+    }
+    let dayIncome = 0, dayExpense = 0;
+    dayAccounts.forEach(a => {
+      if (a.type === 'income') dayIncome += a.amount;
+      else dayExpense += a.amount;
+    });
+    accountSection.innerHTML = `
+      <div style="margin-top: 15px; padding-top: 15px; border-top: 1px solid #eee;">
+        <h4 style="margin: 0 0 8px 0; color: #5a6c5e;">💰 账本</h4>
+        <div style="display:flex;justify-content:space-between;font-size:0.9rem;">
+          <span style="color:#27ae60;">收入: +¥${dayIncome.toFixed(2)}</span>
+          <span style="color:#e74c3c;">支出: -¥${dayExpense.toFixed(2)}</span>
+          <span style="color:#333;font-weight:600;">结余: ¥${(dayIncome - dayExpense).toFixed(2)}</span>
+        </div>
+        <ul style="margin-top:8px;padding-left:20px;font-size:0.85rem;color:#666;">
+          ${dayAccounts.map(a => `<li>${a.category}: ${a.type === 'income' ? '+' : '-'}¥${a.amount.toFixed(2)} ${escapeHtml(a.remark || '')}</li>`).join('')}
+        </ul>
+      </div>
+    `;
+    accountSection.style.display = 'block';
+  } else if (accountSection) {
+    accountSection.style.display = 'none';
+  }
+
+  DOM.dayDetailModal.style.display = 'flex';
+}
+
+function closeDayDetailModal() {
+  DOM.dayDetailModal.style.display = 'none';
+}
+
+// ==================== 回收站功能 ====================
+function renderTrash() {
+  // 从 todos/notes 数组中获取已删除项目（deleted=1）
+  const todos = Storage.get(Storage.keys.todos);
+  const notes = Storage.get(Storage.keys.notes);
+
+  // 确保容器有标签页结构
+  ensureTrashTabs();
+
+  const filterFn = getTrashFilter();
+  const todoTrash = todos.filter(t => t.deleted).filter(filterFn);
+  const noteTrash = notes.filter(n => n.deleted).filter(filterFn);
+
+  // 根据当前标签页渲染
+  const todoPanel = document.getElementById('deleted-todos-panel');
+  const notePanel = document.getElementById('deleted-notes-panel');
+
+  if (todoPanel) {
+    if (todoTrash.length === 0) {
+      todoPanel.innerHTML = '<div class="trash-empty" style="text-align:center;padding:40px;color:#888;"><span class="icon">📭</span><p>没有已删除的待办</p></div>';
+    } else {
+      todoPanel.innerHTML = todoTrash.map(t => {
+        const isSelected = AppState.selectedDeletedTodos.has(String(t.id));
+        const dateStr = formatDate(t.deletedAt || t.updated_at);
+        const statusIcon = t.completed ? '✅' : '⬜';
+        return `
+          <li class="todo-item ${isSelected ? 'selected' : ''}" data-id="${t.id}" style="opacity:0.7;">
+            <label class="trash-checkbox-label" style="margin-right:10px;cursor:pointer;">
+              <input type="checkbox" class="trash-checkbox todo-checkbox" data-id="${t.id}" ${isSelected ? 'checked' : ''}>
+            </label>
+            <div class="trash-item-content" style="flex:1;">
+              <span class="todo-status">${statusIcon}</span>
+              <span class="todo-text" style="${t.completed ? 'text-decoration:line-through;opacity:0.6;' : ''}">${escapeHtml(t.title)}</span>
+              <span class="todo-date" style="font-size:0.75rem;color:#999;margin-left:8px;">${dateStr}</span>
+            </div>
+            <div class="trash-actions" style="margin-left:10px;">
+              <button class="btn btn-primary btn-sm" onclick="restoreTrashItem('${t.id}', 'todo')" style="padding:4px 10px;font-size:12px;">↩️ 恢复</button>
+              <button class="btn btn-danger btn-sm" onclick="permanentDeleteTrashItem('${t.id}')" style="padding:4px 10px;font-size:12px;">🗑️ 彻底删除</button>
+            </div>
+          </li>
+        `;
+      }).join('');
+
+      // 绑定复选框
+      todoPanel.querySelectorAll('.todo-checkbox').forEach(cb => {
+        cb.addEventListener('change', (e) => {
+          const id = e.target.dataset.id;
+          if (e.target.checked) AppState.selectedDeletedTodos.add(id);
+          else AppState.selectedDeletedTodos.delete(id);
+          updateTrashBatchButtons();
+          const card = e.target.closest('.todo-item');
+          if (card) card.classList.toggle('selected', e.target.checked);
+        });
+      });
+    }
+  }
+
+  if (notePanel) {
+    if (noteTrash.length === 0) {
+      notePanel.innerHTML = '<div class="trash-empty" style="text-align:center;padding:40px;color:#888;"><span class="icon">📭</span><p>没有已删除的笔记</p></div>';
+    } else {
+      notePanel.innerHTML = noteTrash.map(n => {
+        const isSelected = AppState.selectedDeletedNotes.has(String(n.id));
+        const dateStr = formatDate(n.deletedAt || n.updated_at);
+        const preview = stripHtml(n.content).slice(0, 60) + (stripHtml(n.content).length > 60 ? '...' : '');
+        return `
+          <div class="note-card ${isSelected ? 'selected' : ''}" data-id="${n.id}" style="opacity:0.7;position:relative;">
+            <label class="trash-checkbox-label" style="position:absolute;top:10px;right:10px;cursor:pointer;">
+              <input type="checkbox" class="trash-checkbox note-checkbox" data-id="${n.id}" ${isSelected ? 'checked' : ''}>
+            </label>
+            <div class="trash-item-content">
+              <h4 style="margin:0 0 8px 0;">${escapeHtml(n.title || '无标题')}</h4>
+              <div class="note-preview" style="font-size:0.85rem;color:#666;">${escapeHtml(preview) || '无内容'}</div>
+              <div style="font-size:0.75rem;color:#999;margin-top:8px;">🗓️ ${dateStr}</div>
+              <div class="trash-actions" style="margin-top:10px;">
+                <button class="btn btn-primary btn-sm" onclick="restoreTrashItem('${n.id}', 'note')" style="padding:4px 10px;font-size:12px;">↩️ 恢复</button>
+                <button class="btn btn-danger btn-sm" onclick="permanentDeleteTrashItem('${n.id}')" style="padding:4px 10px;font-size:12px;">🗑️ 彻底删除</button>
+              </div>
+            </div>
+          </div>
+        `;
+      }).join('');
+
+      notePanel.querySelectorAll('.note-checkbox').forEach(cb => {
+        cb.addEventListener('change', (e) => {
+          const id = e.target.dataset.id;
+          if (e.target.checked) AppState.selectedDeletedNotes.add(id);
+          else AppState.selectedDeletedNotes.delete(id);
+          updateTrashBatchButtons();
+          const card = e.target.closest('.note-card');
+          if (card) card.classList.toggle('selected', e.target.checked);
+        });
+      });
+    }
+  }
+
+  updateTrashBatchButtons();
+}
+
+function ensureTrashTabs() {
+  const trashView = document.getElementById('trash-view');
+  if (!trashView) return;
+
+  let tabsContainer = document.getElementById('trashTabsContainer');
+  let panelsContainer = document.getElementById('trashPanelsContainer');
+
+  if (!tabsContainer) {
+    // 清空原有内容并在顶部插入标签和筛选
+    const header = trashView.querySelector('.view-header');
+
+    const controls = document.createElement('div');
+    controls.id = 'trashControls';
+    controls.style.cssText = 'margin-bottom:16px;display:flex;flex-wrap:wrap;gap:10px;align-items:center;';
+    controls.innerHTML = `
+      <div id="trashTabsContainer" style="display:flex;gap:4px;">
+        <button class="trash-tab ${AppState.currentTrashTab === 'deleted-todos' ? 'active' : ''}" data-trash-tab="deleted-todos" style="padding:6px 14px;border:1px solid #ddd;border-radius:6px;background:${AppState.currentTrashTab === 'deleted-todos' ? '#2d6a4f' : '#fff'};color:${AppState.currentTrashTab === 'deleted-todos' ? '#fff' : '#333'};cursor:pointer;">已删除待办</button>
+        <button class="trash-tab ${AppState.currentTrashTab === 'deleted-notes' ? 'active' : ''}" data-trash-tab="deleted-notes" style="padding:6px 14px;border:1px solid #ddd;border-radius:6px;background:${AppState.currentTrashTab === 'deleted-notes' ? '#2d6a4f' : '#fff'};color:${AppState.currentTrashTab === 'deleted-notes' ? '#fff' : '#333'};cursor:pointer;">已删除笔记</button>
+      </div>
+      <input type="text" id="trashSearchInput" placeholder="搜索标题..." style="padding:6px 10px;border:1px solid #ddd;border-radius:6px;flex:1;min-width:120px;">
+      <select id="trashDateFilter" style="padding:6px 10px;border:1px solid #ddd;border-radius:6px;">
+        <option value="0">全部时间</option>
+        <option value="7">7天内</option>
+        <option value="30">30天内</option>
+        <option value="90">90天内</option>
+      </select>
+      <button id="batchRestoreTrashBtn" class="btn btn-primary btn-sm" style="display:none;padding:6px 12px;font-size:12px;">↩️ 批量恢复</button>
+      <button id="batchPermDeleteTrashBtn" class="btn btn-danger btn-sm" style="display:none;padding:6px 12px;font-size:12px;">🗑️ 批量彻底删除</button>
+    `;
+
+    if (header && header.nextSibling) {
+      trashView.insertBefore(controls, header.nextSibling);
+    } else {
+      trashView.insertBefore(controls, trashView.firstChild);
+    }
+
+    // 替换原有列表容器为面板容器
+    const oldTodosList = document.getElementById('trashTodosList');
+    const oldNotesList = document.getElementById('trashNotesList');
+
+    panelsContainer = document.createElement('div');
+    panelsContainer.id = 'trashPanelsContainer';
+    panelsContainer.style.cssText = 'margin-top:10px;';
+
+    const todoPanel = document.createElement('div');
+    todoPanel.id = 'deleted-todos-panel';
+    todoPanel.className = 'trash-panel';
+    todoPanel.style.cssText = AppState.currentTrashTab === 'deleted-todos' ? '' : 'display:none;';
+
+    const notePanel = document.createElement('div');
+    notePanel.id = 'deleted-notes-panel';
+    notePanel.className = 'trash-panel';
+    notePanel.style.cssText = AppState.currentTrashTab === 'deleted-notes' ? 'display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:12px;' : 'display:none;';
+
+    if (oldTodosList) {
+      oldTodosList.parentNode.insertBefore(panelsContainer, oldTodosList);
+      todoPanel.innerHTML = oldTodosList.innerHTML;
+      oldTodosList.style.display = 'none';
+    }
+    if (oldNotesList) {
+      notePanel.innerHTML = oldNotesList.innerHTML;
+      oldNotesList.style.display = 'none';
+    }
+
+    panelsContainer.appendChild(todoPanel);
+    panelsContainer.appendChild(notePanel);
+
+    // 绑定标签切换
+    document.querySelectorAll('.trash-tab').forEach(tab => {
+      tab.addEventListener('click', () => {
+        document.querySelectorAll('.trash-tab').forEach(t => {
+          t.classList.remove('active');
+          t.style.background = '#fff';
+          t.style.color = '#333';
+        });
+        tab.classList.add('active');
+        tab.style.background = '#2d6a4f';
+        tab.style.color = '#fff';
+
+        AppState.currentTrashTab = tab.dataset.trashTab;
+        document.querySelectorAll('.trash-panel').forEach(p => p.style.display = 'none');
+        const panel = document.getElementById(tab.dataset.trashTab + '-panel');
+        if (panel) {
+          panel.style.display = tab.dataset.trashTab === 'deleted-notes' ? 'grid' : 'block';
+          if (tab.dataset.trashTab === 'deleted-notes') {
+            panel.style.gridTemplateColumns = 'repeat(auto-fill, minmax(250px, 1fr))';
+            panel.style.gap = '12px';
+          }
+        }
+        renderTrash();
+      });
+    });
+
+    // 绑定搜索和筛选
+    const searchInput = document.getElementById('trashSearchInput');
+    const dateFilter = document.getElementById('trashDateFilter');
+    if (searchInput) searchInput.addEventListener('input', () => renderTrash());
+    if (dateFilter) dateFilter.addEventListener('change', () => renderTrash());
+
+    // 绑定批量按钮
+    const batchRestoreBtn = document.getElementById('batchRestoreTrashBtn');
+    const batchPermDeleteBtn = document.getElementById('batchPermDeleteTrashBtn');
+    if (batchRestoreBtn) batchRestoreBtn.addEventListener('click', batchRestoreTrash);
+    if (batchPermDeleteBtn) batchPermDeleteBtn.addEventListener('click', batchPermanentlyDeleteTrash);
+  }
+}
+
+function getTrashFilter() {
+  const searchInput = document.getElementById('trashSearchInput');
+  const dateFilter = document.getElementById('trashDateFilter');
+  const keyword = searchInput ? searchInput.value.trim().toLowerCase() : '';
+  const days = dateFilter ? parseInt(dateFilter.value) || 0 : 0;
+  const cutoff = days > 0 ? Date.now() - days * 24 * 60 * 60 * 1000 : 0;
+  return function filterItem(item) {
+    if (keyword && !(item.title || '').toLowerCase().includes(keyword)) return false;
+    const deletedTime = item.updated_at ? new Date(item.updated_at).getTime() : 0;
+    if (days > 0 && deletedTime > 0 && deletedTime < cutoff) return false;
+    return true;
+  };
+}
+
+function updateTrashBatchButtons() {
+  const hasTodos = AppState.selectedDeletedTodos.size > 0;
+  const hasNotes = AppState.selectedDeletedNotes.size > 0;
+  const hasSelected = hasTodos || hasNotes;
+
+  const batchRestoreBtn = document.getElementById('batchRestoreTrashBtn');
+  const batchPermDeleteBtn = document.getElementById('batchPermDeleteTrashBtn');
+
+  if (batchRestoreBtn) batchRestoreBtn.style.display = hasSelected ? 'inline-block' : 'none';
+  if (batchPermDeleteBtn) batchPermDeleteBtn.style.display = hasSelected ? 'inline-block' : 'none';
+}
+
+function restoreTrashItem(id, type) {
+  const dataKey = type === 'todo' ? Storage.keys.todos : Storage.keys.notes;
+  const data = Storage.get(dataKey);
+  const item = data.find(t => String(t.id) === String(id));
+
+  if (!item || !item.deleted) return;
+
+  item.deleted = 0;
+  item.restored_at = new Date().toISOString();
+  Storage.set(dataKey, data);
+
+  if (type === 'todo') AppState.selectedDeletedTodos.delete(String(id));
+  else AppState.selectedDeletedNotes.delete(String(id));
+
+  renderTrash();
+  renderCurrentView();
+  showToast('已恢复');
+}
+
+function permanentDeleteTrashItem(id) {
+  showConfirmDialog('确定要彻底删除吗？此操作不可恢复！', '⚠️ 彻底删除').then(confirmed => {
+    if (!confirmed) return;
+    // 从 todos 和 notes 中彻底删除
+    const todos = Storage.get(Storage.keys.todos);
+    const notes = Storage.get(Storage.keys.notes);
+    Storage.set(Storage.keys.todos, todos.filter(t => String(t.id) !== String(id)));
+    Storage.set(Storage.keys.notes, notes.filter(n => String(n.id) !== String(id)));
+    AppState.selectedDeletedTodos.delete(String(id));
+    AppState.selectedDeletedNotes.delete(String(id));
+    renderTrash();
+    showToast('已彻底删除');
+  });
+}
+
+function batchRestoreTrash() {
+  const todoIds = Array.from(AppState.selectedDeletedTodos);
+  const noteIds = Array.from(AppState.selectedDeletedNotes);
+  if (todoIds.length === 0 && noteIds.length === 0) return;
+
+  const todos = Storage.get(Storage.keys.todos);
+  const notes = Storage.get(Storage.keys.notes);
+
+  todoIds.forEach(id => {
+    const item = todos.find(t => String(t.id) === String(id));
+    if (item) { item.deleted = 0; item.restored_at = new Date().toISOString(); }
+  });
+  noteIds.forEach(id => {
+    const item = notes.find(n => String(n.id) === String(id));
+    if (item) { item.deleted = 0; item.restored_at = new Date().toISOString(); }
+  });
+
+  Storage.set(Storage.keys.todos, todos);
+  Storage.set(Storage.keys.notes, notes);
+
+  AppState.selectedDeletedTodos.clear();
+  AppState.selectedDeletedNotes.clear();
+  renderTrash();
+  renderCurrentView();
+  showToast('批量恢复完成');
+}
+
+function batchPermanentlyDeleteTrash() {
+  const todoIds = Array.from(AppState.selectedDeletedTodos);
+  const noteIds = Array.from(AppState.selectedDeletedNotes);
+  const total = todoIds.length + noteIds.length;
+  if (total === 0) return;
+
+  showConfirmDialog(`确定要彻底删除选中的 ${total} 个项目吗？此操作不可恢复！`, '⚠️ 彻底删除').then(confirmed => {
+    if (!confirmed) return;
+    const todos = Storage.get(Storage.keys.todos);
+    const notes = Storage.get(Storage.keys.notes);
+
+    const deleteIds = new Set([...todoIds, ...noteIds].map(id => String(id)));
+    Storage.set(Storage.keys.todos, todos.filter(t => !deleteIds.has(String(t.id))));
+    Storage.set(Storage.keys.notes, notes.filter(n => !deleteIds.has(String(n.id))));
+
+    AppState.selectedDeletedTodos.clear();
+    AppState.selectedDeletedNotes.clear();
+    renderTrash();
+    showToast('已彻底删除');
+  });
+}
+
+function emptyTrash() {
+  const todos = Storage.get(Storage.keys.todos);
+  const notes = Storage.get(Storage.keys.notes);
+  const deletedTodos = todos.filter(t => t.deleted);
+  const deletedNotes = notes.filter(n => n.deleted);
+  const total = deletedTodos.length + deletedNotes.length;
+
+  if (total === 0) {
+    showToast('回收站是空的');
+    return;
+  }
+
+  showConfirmDialog(`确定要清空回收站吗？共 ${total} 个项目，此操作不可恢复！`, '⚠️ 清空回收站').then(confirmed => {
+    if (!confirmed) return;
+    Storage.set(Storage.keys.todos, todos.filter(t => !t.deleted));
+    Storage.set(Storage.keys.notes, notes.filter(n => !n.deleted));
+    AppState.selectedDeletedTodos.clear();
+    AppState.selectedDeletedNotes.clear();
+    renderTrash();
+    showToast('回收站已清空');
+  });
+}
+
+// ==================== 记账功能 ====================
+function renderAccounts() {
+  const accounts = Storage.get(Storage.keys.accounts);
+
+  ensureAccountFilters();
+
+  const filterTypeEl = document.getElementById('accountFilterType');
+  const startDateEl = document.getElementById('accountStartDate');
+  const endDateEl = document.getElementById('accountEndDate');
+  const monthPickerEl = document.getElementById('accountMonthPicker');
+  const yearPickerEl = document.getElementById('accountYearPicker');
+
+  const filterType = filterTypeEl ? filterTypeEl.value : 'all';
+
+  let range = { start: '1970-01-01', end: '2100-12-31' };
+  const today = new Date();
+
+  switch (filterType) {
+    case 'month':
+      if (monthPickerEl && monthPickerEl.value) {
+        const [y, m] = monthPickerEl.value.split('-').map(Number);
+        range.start = `${y}-${String(m).padStart(2,'0')}-01`;
+        range.end = `${y}-${String(m).padStart(2,'0')}-${new Date(y, m, 0).getDate()}`;
+      } else {
+        range.start = `${today.getFullYear()}-${String(today.getMonth()+1).padStart(2,'0')}-01`;
+        range.end = `${today.getFullYear()}-${String(today.getMonth()+1).padStart(2,'0')}-${new Date(today.getFullYear(), today.getMonth()+1, 0).getDate()}`;
+      }
+      break;
+    case 'year':
+      if (yearPickerEl && yearPickerEl.value) {
+        const y = parseInt(yearPickerEl.value);
+        range.start = `${y}-01-01`;
+        range.end = `${y}-12-31`;
+      } else {
+        range.start = `${today.getFullYear()}-01-01`;
+        range.end = `${today.getFullYear()}-12-31`;
+      }
+      break;
+    case 'custom':
+      range.start = startDateEl && startDateEl.value ? startDateEl.value : '1970-01-01';
+      range.end = endDateEl && endDateEl.value ? endDateEl.value : '2100-12-31';
+      break;
+  }
+
+  const filteredAccounts = accounts.filter(a => a.date >= range.start && a.date <= range.end);
+
+  const income = filteredAccounts.filter(a => a.type === 'income').reduce((sum, a) => sum + a.amount, 0);
+  const expense = filteredAccounts.filter(a => a.type === 'expense').reduce((sum, a) => sum + a.amount, 0);
+
+  const monthIncomeEl = document.getElementById('monthIncome');
+  const monthExpenseEl = document.getElementById('monthExpense');
+  const monthBalanceEl = document.getElementById('monthBalance');
+
+  if (monthIncomeEl) monthIncomeEl.textContent = `¥${income.toFixed(2)}`;
+  if (monthExpenseEl) monthExpenseEl.textContent = `¥${expense.toFixed(2)}`;
+  if (monthBalanceEl) monthBalanceEl.textContent = `¥${(income - expense).toFixed(2)}`;
+
+  // 按日期分组
+  const groupedByDate = {};
+  filteredAccounts.forEach(a => {
+    if (!groupedByDate[a.date]) groupedByDate[a.date] = [];
+    groupedByDate[a.date].push(a);
+  });
+
+  const sortedDates = Object.keys(groupedByDate).sort((a, b) => new Date(b) - new Date(a));
+
+  if (filteredAccounts.length === 0) {
+    DOM.accountList.innerHTML = '<div class="empty-state" style="text-align:center;padding:40px;color:#999;"><p>暂无记账记录</p></div>';
+    return;
+  }
+
+  let html = '';
+  sortedDates.forEach(date => {
+    const dayRecords = groupedByDate[date];
+    let dayIncome = 0, dayExpense = 0;
+    dayRecords.forEach(r => {
+      if (r.type === 'income') dayIncome += r.amount;
+      else dayExpense += r.amount;
+    });
+
+    html += `
+      <div class="account-day-group" style="margin-bottom: 8px; border-radius: 8px; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,0.1);">
+        <div class="account-day-header" style="display: flex; align-items: center; padding: 12px 15px; background: #f5f5f5; cursor: pointer; user-select: none;">
+          <span class="account-toggle-icon" style="margin-right: 10px; font-size: 10px; color: #666; transition: transform 0.2s;">▶</span>
+          <span style="flex: 1; font-weight: 600; color: #333; font-size: 14px;">${date}</span>
+          <span style="margin-right: 15px; color: #27ae60; font-weight: 500; font-size: 13px;">+¥${dayIncome.toFixed(2)}</span>
+          <span style="margin-right: 15px; color: #e74c3c; font-weight: 500; font-size: 13px;">-¥${dayExpense.toFixed(2)}</span>
+          <span style="font-weight: 600; font-size: 13px; color: ${dayIncome - dayExpense >= 0 ? '#27ae60' : '#e74c3c'};">结余: ¥${(dayIncome - dayExpense).toFixed(2)}</span>
+        </div>
+        <div class="account-day-items" style="display: none; background: #fff;">
+    `;
+
+    dayRecords.forEach(a => {
+      html += `
+        <li class="account-item" style="padding: 12px 15px; border-bottom: 1px solid #eee; display: flex; justify-content: space-between; align-items: center;">
+          <div style="display: flex; align-items: center; gap: 10px; flex: 1;">
+            <span style="font-size: 0.9rem; color: #666;">${a.category}</span>
+            <span style="font-size: 0.85rem; color: #999;">${escapeHtml(a.remark || '')}</span>
+          </div>
+          <div style="display: flex; align-items: center; gap: 10px;">
+            <span style="font-weight: 600; color: ${a.type === 'income' ? '#27ae60' : '#e74c3c'}; font-size: 14px;">${a.type === 'income' ? '+' : '-'}¥${a.amount.toFixed(2)}</span>
+            <button class="btn btn-outline btn-sm" onclick="editAccount('${a.id}')" style="padding:4px 10px;font-size:12px;">编辑</button>
+            <button class="btn btn-danger btn-sm" onclick="deleteAccount('${a.id}')" style="padding:4px 10px;font-size:12px;">删除</button>
+          </div>
+        </li>
+      `;
+    });
+
+    html += '</div></div>';
+  });
+
+  DOM.accountList.innerHTML = html;
+
+  // 绑定展开/折叠
+  document.querySelectorAll('.account-day-header').forEach(header => {
+    header.addEventListener('click', (e) => {
+      if (e.target.classList.contains('account-day-checkbox')) return;
+      const dayGroup = header.closest('.account-day-group');
+      const itemsContainer = dayGroup.querySelector('.account-day-items');
+      const toggleIcon = header.querySelector('.account-toggle-icon');
+      if (itemsContainer) {
+        const isExpanded = itemsContainer.style.display !== 'none';
+        itemsContainer.style.display = isExpanded ? 'none' : 'block';
+        if (toggleIcon) toggleIcon.style.transform = isExpanded ? 'rotate(0deg)' : 'rotate(90deg)';
+      }
+    });
+  });
+}
+
+function ensureAccountFilters() {
+  let filterContainer = document.getElementById('accountFilterContainer');
+  if (filterContainer) return;
+
+  const accountView = document.getElementById('account-view');
+  if (!accountView) return;
+
+  const header = accountView.querySelector('.view-header');
+  filterContainer = document.createElement('div');
+  filterContainer.id = 'accountFilterContainer';
+  filterContainer.style.cssText = 'margin-bottom:16px;display:flex;flex-wrap:wrap;gap:10px;align-items:center;';
+  filterContainer.innerHTML = `
+    <select id="accountFilterType" style="padding:6px 10px;border:1px solid #ddd;border-radius:6px;">
+      <option value="all">全部</option>
+      <option value="month">按月</option>
+      <option value="year">按年</option>
+      <option value="custom">自定义</option>
+    </select>
+    <input type="month" id="accountMonthPicker" style="display:none;padding:6px 10px;border:1px solid #ddd;border-radius:6px;">
+    <input type="number" id="accountYearPicker" style="display:none;padding:6px 10px;border:1px solid #ddd;border-radius:6px;width:100px;" placeholder="年份">
+    <input type="date" id="accountStartDate" style="display:none;padding:6px 10px;border:1px solid #ddd;border-radius:6px;">
+    <span id="accountDateSeparator" style="display:none;">~</span>
+    <input type="date" id="accountEndDate" style="display:none;padding:6px 10px;border:1px solid #ddd;border-radius:6px;">
+    <button id="accountFilterBtn" class="btn btn-primary btn-sm" style="padding:6px 14px;font-size:13px;">筛选</button>
+  `;
+
+  if (header && header.nextSibling) {
+    accountView.insertBefore(filterContainer, header.nextSibling);
+  } else {
+    accountView.insertBefore(filterContainer, accountView.firstChild);
+  }
+
+  const filterTypeEl = document.getElementById('accountFilterType');
+  const monthPickerEl = document.getElementById('accountMonthPicker');
+  const yearPickerEl = document.getElementById('accountYearPicker');
+  const startDateEl = document.getElementById('accountStartDate');
+  const endDateEl = document.getElementById('accountEndDate');
+  const separatorEl = document.getElementById('accountDateSeparator');
+  const filterBtn = document.getElementById('accountFilterBtn');
+
+  if (filterTypeEl) {
+    filterTypeEl.addEventListener('change', () => {
+      const type = filterTypeEl.value;
+      monthPickerEl.style.display = 'none';
+      yearPickerEl.style.display = 'none';
+      startDateEl.style.display = 'none';
+      endDateEl.style.display = 'none';
+      separatorEl.style.display = 'none';
+
+      if (type === 'month') {
+        monthPickerEl.style.display = 'inline-block';
+        if (!monthPickerEl.value) {
+          const today = new Date();
+          monthPickerEl.value = `${today.getFullYear()}-${String(today.getMonth()+1).padStart(2,'0')}`;
+        }
+      } else if (type === 'year') {
+        yearPickerEl.style.display = 'inline-block';
+        if (!yearPickerEl.value) yearPickerEl.value = new Date().getFullYear();
+      } else if (type === 'custom') {
+        startDateEl.style.display = 'inline-block';
+        endDateEl.style.display = 'inline-block';
+        separatorEl.style.display = 'inline';
+        if (!startDateEl.value) {
+          const today = new Date().toISOString().split('T')[0];
+          startDateEl.value = today;
+          endDateEl.value = today;
+        }
+      }
+    });
+  }
+
+  if (filterBtn) filterBtn.addEventListener('click', () => renderAccounts());
+}
+
+function openAccountModal(accountId = null) {
+  AppState.editingAccountId = accountId;
+
+  if (accountId) {
+    const accounts = Storage.get(Storage.keys.accounts);
+    const account = accounts.find(a => a.id === accountId);
+    if (account) {
+      DOM.accountType.value = account.type;
+      DOM.accountAmount.value = account.amount;
+      DOM.accountCategory.value = account.category;
+      DOM.accountDate.value = account.date;
+      DOM.accountRemark.value = account.remark || '';
+    }
+  } else {
+    DOM.accountType.value = 'expense';
+    DOM.accountAmount.value = '';
+    DOM.accountCategory.value = '餐饮';
+    DOM.accountDate.value = new Date().toISOString().split('T')[0];
+    DOM.accountRemark.value = '';
+  }
+
+  DOM.accountModal.style.display = 'flex';
+}
+
+function closeAccountModal() {
+  DOM.accountModal.style.display = 'none';
+  AppState.editingAccountId = null;
+}
+
+async function saveAccount() {
+  const amount = parseFloat(DOM.accountAmount.value);
+  if (isNaN(amount) || amount <= 0) {
+    showToast('请输入有效的金额', 'error');
+    return;
+  }
+
+  const accounts = Storage.get(Storage.keys.accounts);
+  const now = new Date().toISOString();
+
+  if (AppState.editingAccountId) {
+    const index = accounts.findIndex(a => a.id === AppState.editingAccountId);
+    if (index !== -1) {
+      accounts[index] = {
+        ...accounts[index],
+        type: DOM.accountType.value,
+        amount,
+        category: DOM.accountCategory.value,
+        date: DOM.accountDate.value,
+        remark: DOM.accountRemark.value.trim(),
+        noteId: accounts[index].noteId || null,
+        created_at: accounts[index].created_at || now
+      };
+    }
+  } else {
+    accounts.push({
+      id: generateId(),
+      type: DOM.accountType.value,
+      amount,
+      category: DOM.accountCategory.value,
+      date: DOM.accountDate.value,
+      remark: DOM.accountRemark.value.trim(),
+      noteId: null,
+      created_at: now
+    });
+  }
+
+  Storage.set(Storage.keys.accounts, accounts);
+
+  // 如果有 WebDAV，自动同步
+  if (Storage.webdav && !AppState.syncInProgress) {
+    await Storage.sync();
+  }
+
+  closeAccountModal();
+  renderAccounts();
+}
+
+function editAccount(id) {
+  openAccountModal(id);
+}
+
+function deleteAccount(id) {
+  showConfirmDialog('确定要删除这条记录吗？').then(confirmed => {
+    if (!confirmed) return;
+    const accounts = Storage.get(Storage.keys.accounts);
+    Storage.set(Storage.keys.accounts, accounts.filter(a => a.id !== id));
+    renderAccounts();
+  });
+}
+
+// ==================== 数据管理 ====================
+function exportData() {
+  const data = Storage.export();
+  const json = JSON.stringify(data, null, 2);
+
+  DOM.dataModalTitle.textContent = '导出数据';
+  DOM.dataModalContent.innerHTML = `
+    <div class="data-content">
+      <p>请复制以下数据保存到安全的地方：</p>
+      <textarea class="data-textarea" readonly>${escapeHtml(json)}</textarea>
+      <button class="btn btn-primary" style="margin-top: 10px;" onclick="copyExportData()">📋 复制到剪贴板</button>
+    </div>
+  `;
+  DOM.dataModal.style.display = 'flex';
+}
+
+function copyExportData() {
+  const textarea = DOM.dataModalContent.querySelector('textarea');
+  textarea.select();
+  document.execCommand('copy');
+  showToast('已复制到剪贴板');
+}
+
+function importData() {
+  DOM.dataModalTitle.textContent = '导入数据';
+  DOM.dataModalContent.innerHTML = `
+    <div class="data-content">
+      <p>请粘贴之前导出的数据：</p>
+      <textarea class="data-textarea" id="importDataTextarea" placeholder="在此粘贴 JSON 数据..."></textarea>
+      <div style="margin-top: 10px;">
+        <button class="btn btn-secondary" onclick="closeDataModal()">取消</button>
+        <button class="btn btn-primary" onclick="confirmImportData()">导入</button>
+      </div>
+    </div>
+  `;
+  DOM.dataModal.style.display = 'flex';
+}
+
+function confirmImportData() {
+  const textarea = document.getElementById('importDataTextarea');
+  try {
+    const data = JSON.parse(textarea.value.trim());
+    showConfirmDialog('导入数据将覆盖现有数据，确定要继续吗？').then(confirmed => {
+      if (!confirmed) return;
+      Storage.import(data);
+      showToast('导入成功');
+      closeDataModal();
+      renderCurrentView();
+    });
+  } catch (e) {
+    showToast('数据格式错误，请检查输入', 'error');
+  }
+}
+
+function clearAllData() {
+  showConfirmDialog('⚠️ 警告：这将删除所有数据且不可恢复！确定要继续吗？', '⚠️ 清空数据').then(confirmed => {
+    if (!confirmed) return;
+    showConfirmDialog('再次确认：您真的要清空所有数据吗？', '⚠️ 最终确认').then(confirmed2 => {
+      if (!confirmed2) return;
+      Storage.clear();
+      showToast('所有数据已清空');
+      renderCurrentView();
+    });
+  });
+}
+
+function closeDataModal() {
+  DOM.dataModal.style.display = 'none';
+}
+
+// ==================== 工具函数 ====================
+function generateId() {
+  return Date.now() + Math.floor(Math.random() * 1000);
+}
+
+function escapeHtml(text) {
+  if (!text) return '';
+  const div = document.createElement('div');
+  div.textContent = text;
+  return div.innerHTML;
+}
+
+function stripHtml(html) {
+  if (!html) return '';
+  const tmp = document.createElement('div');
+  tmp.innerHTML = html;
+  return tmp.textContent || tmp.innerText || '';
+}
+
+function formatDate(dateStr) {
+  if (!dateStr) return '';
+  const date = new Date(dateStr);
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+}
+
+function formatDateTime(dateStr) {
+  if (!dateStr) return '';
+  const date = new Date(dateStr);
+  return `${date.getFullYear()}/${String(date.getMonth() + 1).padStart(2, '0')}/${String(date.getDate()).padStart(2, '0')} ${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}:${String(date.getSeconds()).padStart(2, '0')}`;
+}
+
+// ==================== Web Crypto API 加密 ====================
+const CryptoHelper = {
+  // 从密码派生AES密钥
+  async deriveKey(password, salt) {
+    const encoder = new TextEncoder();
+    const keyMaterial = await crypto.subtle.importKey(
+      'raw',
+      encoder.encode(password),
+      { name: 'PBKDF2' },
+      false,
+      ['deriveKey']
+    );
+    return crypto.subtle.deriveKey(
+      {
+        name: 'PBKDF2',
+        salt: salt,
+        iterations: 100000,
+        hash: 'SHA-256'
+      },
+      keyMaterial,
+      { name: 'AES-GCM', length: 256 },
+      false,
+      ['encrypt', 'decrypt']
+    );
+  },
+
+  // 加密内容
+  async encrypt(content, password) {
+    const encoder = new TextEncoder();
+    const salt = crypto.getRandomValues(new Uint8Array(16));
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const key = await this.deriveKey(password, salt);
+    const ciphertext = await crypto.subtle.encrypt(
+      { name: 'AES-GCM', iv },
+      key,
+      encoder.encode(content)
+    );
+    // 组合 salt + iv + ciphertext
+    const combined = new Uint8Array(salt.length + iv.length + ciphertext.byteLength);
+    combined.set(salt, 0);
+    combined.set(iv, salt.length);
+    combined.set(new Uint8Array(ciphertext), salt.length + iv.length);
+    return btoa(String.fromCharCode(...combined));
+  },
+
+  // 解密内容
+  async decrypt(encryptedBase64, password) {
+    const combined = new Uint8Array(atob(encryptedBase64).split('').map(c => c.charCodeAt(0)));
+    const salt = combined.slice(0, 16);
+    const iv = combined.slice(16, 28);
+    const ciphertext = combined.slice(28);
+    const key = await this.deriveKey(password, salt);
+    const decrypted = await crypto.subtle.decrypt(
+      { name: 'AES-GCM', iv },
+      key,
+      ciphertext
+    );
+    const decoder = new TextDecoder();
+    return decoder.decode(decrypted);
+  },
+
+  // 验证密码（简单hash比对）
+  async hashPassword(password) {
+    const encoder = new TextEncoder();
+    const data = encoder.encode(password);
+    const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+    const hashArray = Array.from(new Uint8Array(hashBuffer));
+    return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+  }
+};
