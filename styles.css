@@ -625,6 +625,18 @@ body {
     display: none;
   }
 
+  .nav-item.mobile-only {
+    display: flex !important;
+  }
+
+  #calendarCalcBtn {
+    bottom: 70px;
+    right: 10px;
+    width: 44px;
+    height: 44px;
+    font-size: 18px;
+  }
+
   .main-content {
     padding: 0 12px 80px;
     height: calc(100vh - 60px);

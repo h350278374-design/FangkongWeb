@@ -37,6 +37,8 @@ class WebDAVClient {
       const response = await fetch(url, {
         method,
         headers,
+        mode: 'cors',
+        credentials: 'omit',
         ...options
       });
 
@@ -1347,21 +1349,46 @@ function showCustomAlert(message, type = 'info') {
 
 // ==================== 计算器 ====================
 function initCalculator() {
-  let calcBtn = document.getElementById('calcBtn');
   let calcModal = document.getElementById('calcModal');
 
-  // 如果 HTML 中没有，动态创建按钮和弹窗
-  if (!calcBtn) {
-    const sidebar = document.querySelector('.sidebar');
-    if (sidebar) {
-      calcBtn = document.createElement('button');
-      calcBtn.id = 'calcBtn';
-      calcBtn.className = 'btn btn-outline';
-      calcBtn.style.cssText = 'width:100%;margin-top:8px;';
-      calcBtn.textContent = '🧮 计算器';
-      sidebar.appendChild(calcBtn);
-    }
+  // 创建计算器弹窗
+  if (!calcModal) {
+    calcModal = document.createElement('div');
+    calcModal.id = 'calcModal';
+    calcModal.className = 'modal';
+    calcModal.style.cssText = 'display:none;align-items:center;justify-content:center;';
+    calcModal.innerHTML = `
+      <div class="modal-content" style="max-width:320px;">
+        <h3>🧮 计算器</h3>
+        <div id="calcDisplay" style="background:#f5f5f5;padding:12px;border-radius:6px;text-align:right;font-size:1.4rem;margin-bottom:12px;min-height:40px;">0</div>
+        <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;">
+          <button class="calc-key" data-action="clear" style="padding:12px;border:1px solid #ddd;border-radius:6px;background:#fff;cursor:pointer;">C</button>
+          <button class="calc-key" data-action="delete" style="padding:12px;border:1px solid #ddd;border-radius:6px;background:#fff;cursor:pointer;">⌫</button>
+          <button class="calc-key" data-op="/" style="padding:12px;border:1px solid #ddd;border-radius:6px;background:#fff;cursor:pointer;">÷</button>
+          <button class="calc-key" data-op="*" style="padding:12px;border:1px solid #ddd;border-radius:6px;background:#fff;cursor:pointer;">×</button>
+          <button class="calc-key" data-num="7" style="padding:12px;border:1px solid #ddd;border-radius:6px;background:#fff;cursor:pointer;">7</button>
+          <button class="calc-key" data-num="8" style="padding:12px;border:1px solid #ddd;border-radius:6px;background:#fff;cursor:pointer;">8</button>
+          <button class="calc-key" data-num="9" style="padding:12px;border:1px solid #ddd;border-radius:6px;background:#fff;cursor:pointer;">9</button>
+          <button class="calc-key" data-op="-" style="padding:12px;border:1px solid #ddd;border-radius:6px;background:#fff;cursor:pointer;">-</button>
+          <button class="calc-key" data-num="4" style="padding:12px;border:1px solid #ddd;border-radius:6px;background:#fff;cursor:pointer;">4</button>
+          <button class="calc-key" data-num="5" style="padding:12px;border:1px solid #ddd;border-radius:6px;background:#fff;cursor:pointer;">5</button>
+          <button class="calc-key" data-num="6" style="padding:12px;border:1px solid #ddd;border-radius:6px;background:#fff;cursor:pointer;">6</button>
+          <button class="calc-key" data-op="+" style="padding:12px;border:1px solid #ddd;border-radius:6px;background:#fff;cursor:pointer;">+</button>
+          <button class="calc-key" data-num="1" style="padding:12px;border:1px solid #ddd;border-radius:6px;background:#fff;cursor:pointer;">1</button>
+          <button class="calc-key" data-num="2" style="padding:12px;border:1px solid #ddd;border-radius:6px;background:#fff;cursor:pointer;">2</button>
+          <button class="calc-key" data-num="3" style="padding:12px;border:1px solid #ddd;border-radius:6px;background:#fff;cursor:pointer;">3</button>
+          <button class="calc-key" data-action="equals" style="padding:12px;border:1px solid #ddd;border-radius:6px;background:#2d6a4f;color:#fff;cursor:pointer;grid-row:span 2;">=</button>
+          <button class="calc-key" data-num="0" style="padding:12px;border:1px solid #ddd;border-radius:6px;background:#fff;cursor:pointer;grid-column:span 2;">0</button>
+          <button class="calc-key" data-num="." style="padding:12px;border:1px solid #ddd;border-radius:6px;background:#fff;cursor:pointer;">.</button>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(calcModal);
   }
+
+  // 在日历视图添加计算器悬浮按钮
+  initCalendarCalcBtn();
+}
 
   if (!calcModal) {
     calcModal = document.createElement('div');
@@ -1397,11 +1424,8 @@ function initCalculator() {
     document.body.appendChild(calcModal);
   }
 
-  if (calcBtn && calcModal) {
-    calcBtn.addEventListener('click', () => {
-      calcModal.style.display = 'flex';
-    });
-
+  // 绑定计算器弹窗事件
+  if (calcModal) {
     calcModal.addEventListener('click', (e) => {
       if (e.target === calcModal) calcModal.style.display = 'none';
     });
@@ -1460,6 +1484,62 @@ function initCalculator() {
       });
     });
   }
+
+  // 在日历视图添加计算器悬浮按钮
+  initCalendarCalcBtn();
+}
+
+// 在日历视图初始化计算器悬浮按钮
+function initCalendarCalcBtn() {
+  const calendarView = document.getElementById('calendar-view');
+  if (!calendarView) return;
+
+  // 检查是否已存在
+  if (document.getElementById('calendarCalcBtn')) return;
+
+  const calcBtn = document.createElement('button');
+  calcBtn.id = 'calendarCalcBtn';
+  calcBtn.innerHTML = '🧮';
+  calcBtn.style.cssText = `
+    position: fixed;
+    bottom: 80px;
+    right: 20px;
+    width: 50px;
+    height: 50px;
+    border-radius: 50%;
+    background: #2d6a4f;
+    color: white;
+    border: none;
+    font-size: 20px;
+    cursor: pointer;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+    z-index: 100;
+    display: none;
+    align-items: center;
+    justify-content: center;
+  `;
+
+  calcBtn.addEventListener('click', () => {
+    const calcModal = document.getElementById('calcModal');
+    if (calcModal) calcModal.style.display = 'flex';
+  });
+
+  document.body.appendChild(calcBtn);
+
+  // 监听视图切换，只在日历视图显示
+  function updateCalcBtnVisibility() {
+    const isCalendarVisible = calendarView.classList.contains('active');
+    calcBtn.style.display = isCalendarVisible ? 'flex' : 'none';
+  }
+
+  // 初始检查
+  updateCalcBtnVisibility();
+
+  // 监听所有视图的 class 变化
+  document.querySelectorAll('.view').forEach(view => {
+    const observer = new MutationObserver(updateCalcBtnVisibility);
+    observer.observe(view, { attributes: true, attributeFilter: ['class'] });
+  });
 }
 
 // ==================== 全局密码设置 ====================
@@ -1467,7 +1547,8 @@ function initGlobalPassword() {
   let setPasswordBtn = document.getElementById('setPasswordBtn');
   let setPasswordModal = document.getElementById('setPasswordModal');
 
-  if (!setPasswordBtn) {
+  // 只在桌面端侧边栏添加设置密码按钮，移动端通过设置菜单访问
+  if (!setPasswordBtn && window.innerWidth > 768) {
     const sidebar = document.querySelector('.sidebar');
     if (sidebar) {
       setPasswordBtn = document.createElement('button');
@@ -3663,6 +3744,49 @@ function formatDateTime(dateStr) {
   if (!dateStr) return '';
   const date = new Date(dateStr);
   return `${date.getFullYear()}/${String(date.getMonth() + 1).padStart(2, '0')}/${String(date.getDate()).padStart(2, '0')} ${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}:${String(date.getSeconds()).padStart(2, '0')}`;
+}
+
+// ==================== 移动端设置菜单 ====================
+function showMobileSettings() {
+  // 创建设置弹窗
+  let settingsModal = document.getElementById('mobileSettingsModal');
+  if (!settingsModal) {
+    settingsModal = document.createElement('div');
+    settingsModal.id = 'mobileSettingsModal';
+    settingsModal.className = 'modal';
+    settingsModal.innerHTML = `
+      <div class="modal-content" style="max-width: 320px;">
+        <h3 style="margin-bottom: 16px;">⚙️ 设置</h3>
+        <div style="display: flex; flex-direction: column; gap: 10px;">
+          <button class="btn btn-outline" onclick="openWebDAVModal(); closeMobileSettings();" style="justify-content: flex-start;">🔧 配置同步</button>
+          <button class="btn btn-outline" onclick="syncNow(); closeMobileSettings();" style="justify-content: flex-start;">🔄 立即同步</button>
+          <button class="btn btn-outline" onclick="exportData(); closeMobileSettings();" style="justify-content: flex-start;">📤 导出数据</button>
+          <button class="btn btn-outline" onclick="importData(); closeMobileSettings();" style="justify-content: flex-start;">📥 导入数据</button>
+          <button class="btn btn-outline" onclick="openSetPasswordModal(); closeMobileSettings();" style="justify-content: flex-start;">🔐 设置密码</button>
+          <button class="btn btn-outline" onclick="showCalculatorFromSettings(); closeMobileSettings();" style="justify-content: flex-start;">🧮 计算器</button>
+          <button class="btn btn-outline" onclick="clearAllData(); closeMobileSettings();" style="justify-content: flex-start; color: #bc6c25;">🗑️ 清空数据</button>
+        </div>
+        <button class="btn btn-secondary" onclick="closeMobileSettings()" style="margin-top: 16px; width: 100%;">取消</button>
+      </div>
+    `;
+    document.body.appendChild(settingsModal);
+  }
+  settingsModal.style.display = 'flex';
+}
+
+function closeMobileSettings() {
+  const modal = document.getElementById('mobileSettingsModal');
+  if (modal) modal.style.display = 'none';
+}
+
+function showCalculatorFromSettings() {
+  const calcModal = document.getElementById('calcModal');
+  if (calcModal) calcModal.style.display = 'flex';
+}
+
+function openSetPasswordModal() {
+  let modal = document.getElementById('setPasswordModal');
+  if (modal) modal.style.display = 'flex';
 }
 
 // ==================== Web Crypto API 加密 ====================
