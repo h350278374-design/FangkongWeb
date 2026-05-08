@@ -701,3 +701,10 @@ body {
     font-size: 0.8rem;
   }
 }
+
+/* 日历跳转高亮动画 */
+@keyframes highlight {
+  0% { background-color: #ffd700; }
+  50% { background-color: #fff3cd; }
+  100% { background-color: transparent; }
+}
