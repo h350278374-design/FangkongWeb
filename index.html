@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>放空 · 待办与笔记</title>
   <link rel="stylesheet" href="styles.css">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E🍀%3C/text%3E%3C/svg%3E">
 </head>
 <body>
   <div class="app-container">
@@ -15,13 +16,13 @@
       <div class="nav-item" data-view="account"><span class="icon">💰</span> 记账</div>
       <div class="nav-item" data-view="calendar"><span class="icon">📅</span> 日历</div>
       <div class="nav-item" data-view="trash"><span class="icon">🗑️</span> 回收站</div>
-      <div class="nav-item mobile-only" data-view="settings" onclick="showMobileSettings()" style="display: none;"><span class="icon">⚙️</span> 设置</div>
+      <div class="nav-item mobile-only" onclick="showMobileSettings()" style="display: none;"><span class="icon">⚙️</span> 设置</div>
       <div class="sync-section">
         <div class="sync-status" id="syncStatus">⚫ 未配置同步</div>
-        <button class="btn btn-outline" id="configWebDAV">🔧 配置同步</button>
+        <button class="btn btn-outline" id="selectFolderBtn">📁 选择数据文件夹</button>
+        <button class="btn btn-outline" id="configWebDAV" style="font-size: 0.8rem;">☁️ 跨设备同步</button>
         <button class="btn btn-outline" id="syncNowBtn" style="display: none;">🔄 立即同步</button>
-        <button class="btn btn-outline" id="exportDataBtn">📤 导出本地数据</button>
-        <button class="btn btn-outline" id="importDataBtn">📥 导入本地数据</button>
+        <div id="folderPathDisplay" style="font-size: 11px; color: #5a6c5e; text-align: center; margin-top: 4px; word-break: break-all;"></div>
         <button class="btn btn-outline" id="clearAllBtn" style="color: #bc6c25;">🗑️ 清空所有数据</button>
         <div id="appVersion" style="font-size: 11px; color: #999; text-align: center; margin-top: 8px;">Web v2.0</div>
       </div>
@@ -65,20 +66,21 @@
         <div class="notes-container">
           <div class="notes-list" id="notesList"></div>
           <div class="note-editor-panel" id="noteEditorPanel" style="display: none;">
+            <!-- 标题编辑区域 -->
+            <div style="margin-bottom: 10px;">
+              <input type="text" id="noteTitleInput" placeholder="输入笔记标题..." style="width: 100%; padding: 10px 12px; border: 1px solid #ddd; border-radius: 6px; font-size: 1.1rem; font-weight: 600; color: #2d6a4f;">
+            </div>
             <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
               <span id="noteMeta" style="font-size: 0.85rem; color: #5a6c5e;">📝 新建笔记</span>
               <div style="display: flex; gap: 8px;">
                 <button class="btn btn-outline" id="togglePinNoteBtn" title="置顶笔记" style="font-size:0.85rem;padding:4px 10px;">📌 置顶</button>
-              </div>
-              <span id="saveIndicator" style="font-size: 0.75rem; color: #5a6c5e; opacity: 0; transition: opacity 0.3s;">✓ 已保存</span>
-              <div style="display: flex; gap: 8px;">
-                <button class="btn btn-outline" id="toggleAccountBtn" style="color: #2d6a4f; border-color: #2d6a4f;">💰 开启记账</button>
-                <button class="btn btn-outline" id="toggleEncryptBtn">🔒 加密</button>
                 <button class="btn btn-outline" id="toggleEditBtn">✏️ 编辑</button>
+                <button class="btn btn-outline" id="decryptNoteBtn" style="display:none; color: #2d6a4f; border-color: #2d6a4f;">🔓 解密</button>
                 <button class="btn btn-outline" id="deleteNoteBtn" style="color: #bc6c25; border-color: #bc6c25;">🗑️ 删除</button>
               </div>
+              <span id="saveIndicator" style="font-size: 0.75rem; color: #5a6c5e; opacity: 0; transition: opacity 0.3s;">✓ 已保存</span>
             </div>
-            <div id="editorContainer" style="height: 380px; border: 1px solid #ccc; border-radius: 4px;">
+            <div id="editorContainer" style="height: 340px; border: 1px solid #ccc; border-radius: 4px;">
               <textarea id="noteEditor" style="width: 100%; height: 100%; padding: 12px; border: none; resize: none; font-family: inherit; font-size: 14px; line-height: 1.6;" placeholder="开始输入笔记内容..."></textarea>
             </div>
             <div class="editor-actions">
@@ -130,16 +132,7 @@
             <button class="btn btn-danger" id="emptyTrashBtn" style="background: #bc6c25; color: white;">清空回收站</button>
           </div>
         </div>
-        <div class="trash-container">
-          <div class="trash-section">
-            <h3>已删除的待办</h3>
-            <ul class="trash-list" id="trashTodosList"></ul>
-          </div>
-          <div class="trash-section">
-            <h3>已删除的笔记</h3>
-            <ul class="trash-list" id="trashNotesList"></ul>
-          </div>
-        </div>
+        <div id="trashContent"></div>
       </div>
 
       <!-- 记账视图 -->
@@ -277,7 +270,12 @@
   <div class="modal" id="webdavModal">
     <div class="modal-content">
       <span class="close" id="closeWebDAVModal">&times;</span>
-      <h3>配置 WebDAV 同步</h3>
+      <h3>☁️ 跨设备同步（WebDAV）</h3>
+      <div style="background: #fff3cd; border: 1px solid #ffc107; border-radius: 8px; padding: 12px; margin-bottom: 16px; font-size: 0.8rem; color: #856404;">
+        <strong>⚠️ 网页版限制说明</strong><br>
+        由于浏览器安全策略，网页版连接 WebDAV 需要服务器支持 CORS 跨域访问。<br>
+        如果连接失败，请使用「选择数据文件夹」功能在本地备份，或使用桌面版应用。
+      </div>
       <p style="font-size: 0.85rem; color: #666; margin-bottom: 16px;">
         支持坚果云、Nextcloud 等 WebDAV 服务。配置后数据将在本地和云端双向同步。
       </p>
@@ -301,7 +299,12 @@
         <strong>💡 坚果云配置提示：</strong><br>
         1. 服务器：https://dav.jianguoyun.com/dav/<br>
         2. 用户名：你的坚果云邮箱<br>
-        3. 密码：在坚果云「安全选项」中生成的应用密码
+        3. 密码：在坚果云「安全选项」中生成的应用密码<br>
+        <br>
+        <strong>🔧 连接失败？</strong><br>
+        如果提示 "Failed to fetch"，说明你的 WebDAV 服务器不支持浏览器跨域访问。建议：<br>
+        • 使用「选择数据文件夹」功能在本地备份数据<br>
+        • 或使用桌面版应用（无此限制）
       </div>
       <div class="modal-actions">
         <button class="btn btn-secondary" id="cancelWebDAVBtn">取消</button>
@@ -346,6 +349,28 @@
       <div class="modal-actions">
         <button class="btn btn-secondary" id="confirmCancelBtn">取消</button>
         <button class="btn btn-primary" id="confirmOkBtn">确定</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 密码输入弹窗 -->
+  <div class="modal" id="passwordModal">
+    <div class="modal-content" style="max-width: 400px;">
+      <span class="close" id="closePasswordModal">&times;</span>
+      <h3 id="passwordModalTitle">输入密码</h3>
+      <p id="passwordModalMessage" style="margin-bottom: 16px; color: #555;"></p>
+      <div class="form-row">
+        <label id="passwordLabel">密码：</label>
+        <input type="password" id="passwordInput" placeholder="请输入密码" style="width: 100%; padding: 8px 12px; border: 1px solid #ddd; border-radius: 6px;">
+      </div>
+      <div class="form-row" id="confirmPasswordRow" style="display: none;">
+        <label>确认密码：</label>
+        <input type="password" id="confirmPasswordInput" placeholder="请再次输入密码" style="width: 100%; padding: 8px 12px; border: 1px solid #ddd; border-radius: 6px;">
+      </div>
+      <div id="passwordError" style="color: #e63946; font-size: 0.85rem; margin-top: 8px; display: none;"></div>
+      <div class="modal-actions" style="margin-top: 16px;">
+        <button class="btn btn-secondary" id="passwordCancelBtn">取消</button>
+        <button class="btn btn-primary" id="passwordOkBtn">确定</button>
       </div>
     </div>
   </div>

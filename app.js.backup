@@ -1316,7 +1316,6 @@ function initDOM() {
   DOM.cancelNoteBtn = document.getElementById('cancelNoteBtn');
   DOM.deleteNoteBtn = document.getElementById('deleteNoteBtn');
   DOM.toggleEditBtn = document.getElementById('toggleEditBtn');
-  DOM.decryptNoteBtn = document.getElementById('decryptNoteBtn');
   DOM.togglePinNoteBtn = document.getElementById('togglePinNoteBtn');
   DOM.saveIndicator = document.getElementById('saveIndicator');
   DOM.notesSearchInput = document.getElementById('notesSearchInput');
@@ -1425,7 +1424,6 @@ function bindEvents() {
   DOM.cancelNoteBtn.addEventListener('click', closeNoteEditor);
   DOM.deleteNoteBtn.addEventListener('click', deleteCurrentNote);
   DOM.toggleEditBtn.addEventListener('click', toggleNoteEdit);
-  DOM.decryptNoteBtn.addEventListener('click', toggleNoteEncrypt);
   DOM.togglePinNoteBtn.addEventListener('click', togglePinNote);
   DOM.notesSearchInput.addEventListener('input', searchNotes);
   DOM.clearSearchBtn.addEventListener('click', clearSearch);
@@ -1557,80 +1555,6 @@ function showCustomAlert(message, type = 'info') {
         overlay.remove();
         resolve();
       }
-    });
-  });
-}
-
-// 自定义密码输入弹窗
-function showPasswordDialog(message = '请输入密码', title = '输入密码', needConfirm = false) {
-  return new Promise((resolve) => {
-    const modal = document.getElementById('passwordModal');
-    const titleEl = document.getElementById('passwordModalTitle');
-    const messageEl = document.getElementById('passwordModalMessage');
-    const passwordInput = document.getElementById('passwordInput');
-    const confirmRow = document.getElementById('confirmPasswordRow');
-    const confirmInput = document.getElementById('confirmPasswordInput');
-    const errorEl = document.getElementById('passwordError');
-    const okBtn = document.getElementById('passwordOkBtn');
-    const cancelBtn = document.getElementById('passwordCancelBtn');
-    const closeBtn = document.getElementById('closePasswordModal');
-
-    if (!modal) {
-      // 如果弹窗不存在，降级使用 prompt
-      const password = prompt(message);
-      resolve(password);
-      return;
-    }
-
-    // 设置内容
-    titleEl.textContent = title;
-    messageEl.textContent = message;
-    passwordInput.value = '';
-    confirmInput.value = '';
-    errorEl.style.display = 'none';
-    confirmRow.style.display = needConfirm ? 'block' : 'none';
-    passwordInput.focus();
-
-    // 克隆按钮以清除旧的事件监听器
-    const newOk = okBtn.cloneNode(true);
-    const newCancel = cancelBtn.cloneNode(true);
-    const newClose = closeBtn.cloneNode(true);
-    okBtn.parentNode.replaceChild(newOk, okBtn);
-    cancelBtn.parentNode.replaceChild(newCancel, cancelBtn);
-    closeBtn.parentNode.replaceChild(newClose, closeBtn);
-
-    // 显示弹窗
-    modal.style.display = 'flex';
-
-    // 验证密码
-    const validate = () => {
-      const password = passwordInput.value;
-      if (!password) {
-        errorEl.textContent = '请输入密码';
-        errorEl.style.display = 'block';
-        return;
-      }
-      if (needConfirm) {
-        if (password !== confirmInput.value) {
-          errorEl.textContent = '两次密码不一致';
-          errorEl.style.display = 'block';
-          return;
-        }
-      }
-      modal.style.display = 'none';
-      resolve(password);
-    };
-
-    // 绑定事件
-    newOk.addEventListener('click', validate);
-    newCancel.addEventListener('click', () => { modal.style.display = 'none'; resolve(null); });
-    newClose.addEventListener('click', () => { modal.style.display = 'none'; resolve(null); });
-    passwordInput.addEventListener('keypress', (e) => { if (e.key === 'Enter') validate(); });
-    confirmInput.addEventListener('keypress', (e) => { if (e.key === 'Enter') validate(); });
-
-    // 点击遮罩关闭
-    modal.addEventListener('click', (e) => {
-      if (e.target === modal) { modal.style.display = 'none'; resolve(null); }
     });
   });
 }
@@ -1830,7 +1754,6 @@ function initGlobalPassword() {
 
       const hash = await CryptoHelper.hashPassword(pwd);
       AppState.globalPasswordHash = hash;
-      AppState.tempPassword = pwd;  // 保存密码到内存，用于加密/解密
       localStorage.setItem('fangkong_global_password_hash', hash);
       setPasswordModal.style.display = 'none';
       showToast('密码已设置');
@@ -1847,7 +1770,6 @@ function initGlobalPassword() {
         }
       }
       AppState.globalPasswordHash = null;
-      AppState.tempPassword = null;  // 清除内存中的密码
       localStorage.removeItem('fangkong_global_password_hash');
       setPasswordModal.style.display = 'none';
       showToast('密码已取消');
@@ -2496,24 +2418,19 @@ function toggleTodoComplete(id) {
   }
 }
 
-// 从记账记录跳转到对应笔记（事件绑定方式已实现在 renderAccounts 中）
 function deleteTodo(id) {
   showConfirmDialog('确定要删除这个待办吗？删除后可在回收站恢复。').then(confirmed => {
     if (!confirmed) return;
-    verifyPasswordIfNeeded('删除待办').then(passed => {
-      if (!passed) return;
-      
-      const todos = Storage.get(Storage.keys.todos);
-      const todo = todos.find(t => String(t.id) === String(id));
-      
-      if (todo) {
-        todo.deleted = 1;
-        todo.updated_at = new Date().toISOString();
-        Storage.set(Storage.keys.todos, todos);
-        renderTodos();
-        showToast('已删除，可在回收站恢复');
-      }
-    });
+    const todos = Storage.get(Storage.keys.todos);
+    const todo = todos.find(t => t.id === id);
+
+    if (todo) {
+      todo.deleted = 1;
+      todo.updated_at = new Date().toISOString();
+      Storage.set(Storage.keys.todos, todos);
+      renderTodos();
+      showToast('已删除，可在回收站恢复');
+    }
   });
 }
 
@@ -2702,12 +2619,7 @@ function makeNoteCard(note) {
       }
     });
   } else {
-    card.addEventListener('click', () => {
-      verifyPasswordIfNeeded('查看笔记').then(passed => {
-        if (!passed) return;
-        openNoteEditor(note.id);
-      });
-    });
+    card.addEventListener('click', () => openNoteEditor(note.id));
   }
 
   // 右键菜单
@@ -2748,10 +2660,7 @@ function showNoteContextMenu(e, note) {
         const n = notes.find(x => x.id === noteId);
         if (n) { n.is_pinned = !n.is_pinned; n.updated_at = new Date().toISOString(); Storage.set(Storage.keys.notes, notes); renderNotes(); }
       } else if (action === 'openNote') {
-        verifyPasswordIfNeeded('查看笔记').then(passed => {
-          if (!passed) return;
-          openNoteEditor(noteId);
-        });
+        openNoteEditor(noteId);
       } else if (action === 'deleteNote') {
         deleteNoteById(noteId);
       }
@@ -2784,14 +2693,16 @@ function openNoteEditor(noteId = null) {
 
       if (note.is_encrypted) {
         // 加密笔记：先显示占位符，需要密码才能查看
-        DOM.noteEditor.value = '🔒 此笔记已加密，点击上方「🔓 解密」按钮输入密码查看';
+        DOM.noteEditor.value = '🔒 此笔记已加密，点击「解密」按钮输入密码查看';
         DOM.noteEditor.readOnly = true;
         DOM.noteTitleInput.readOnly = true;
+        DOM.toggleEditBtn.style.display = 'none';
       } else {
         DOM.noteEditor.value = note.content || '';
         DOM.noteEditor.readOnly = true;
         DOM.noteTitleInput.readOnly = true;
         DOM.toggleEditBtn.textContent = '✏️ 编辑';
+        DOM.toggleEditBtn.style.display = 'inline-block';
       }
     }
   } else {
@@ -2818,35 +2729,32 @@ function closeNoteEditor() {
 async function saveNote() {
   const notes = Storage.get(Storage.keys.notes);
   const now = new Date().toISOString();
-  let noteId = AppState.editingNoteId;
-  let title = '';
-  let content = '';
 
   if (AppState.editingNoteId) {
-    // 编辑现有笔记
     const index = notes.findIndex(n => n.id === AppState.editingNoteId);
     if (index !== -1) {
       const note = notes[index];
+      // 如果笔记已加密，不要从编辑器获取内容（编辑器显示的是占位符）
+      let newContent = note.content;
+      let newTitle = note.title;
       if (!note.is_encrypted) {
-        content = DOM.noteEditor.value.trim();
+        const content = DOM.noteEditor.value.trim();
+        newContent = content;
+        // 优先使用手动输入的标题，如果没有则取内容第一行
         const manualTitle = DOM.noteTitleInput.value.trim();
-        title = manualTitle || content.split('\n')[0].substring(0, 50) || '无标题';
-      } else {
-        content = note.content;
-        title = note.title;
+        newTitle = manualTitle || content.split('\n')[0].substring(0, 50) || '无标题';
       }
       notes[index] = {
         ...note,
-        title,
-        content,
+        title: newTitle,
+        content: newContent,
         updated_at: now
       };
     }
   } else {
-    // 新建笔记
-    content = DOM.noteEditor.value.trim();
+    const content = DOM.noteEditor.value.trim();
     const manualTitle = DOM.noteTitleInput.value.trim();
-    title = manualTitle || content.split('\n')[0].substring(0, 50) || '无标题';
+    const title = manualTitle || content.split('\n')[0].substring(0, 50) || '无标题';
     const newNote = {
       id: generateId(),
       title,
@@ -2858,67 +2766,42 @@ async function saveNote() {
       updated_at: now
     };
     notes.push(newNote);
-    noteId = newNote.id;
+
+    // 自动从笔记内容提取金额记账（默认开启）
+    const accountItems = extractAmountsFromText(content);
+    if (accountItems.length > 0) {
+      const totals = calculateTotalAmounts(accountItems);
+      const accounts = Storage.get(Storage.keys.accounts);
+      accounts.push({
+        id: generateId(),
+        type: totals.income > totals.expense ? 'income' : 'expense',
+        amount: Math.abs(totals.income - totals.expense) || Math.max(totals.income, totals.expense),
+        category: '笔记记账',
+        date: now.split('T')[0],
+        remark: `${title}：${accountItems.map(i => i.description).join('，')}`,
+        noteId: newNote.id,
+        created_at: now
+      });
+      Storage.set(Storage.keys.accounts, accounts);
+      showToast(`已自动记账：收入¥${totals.income.toFixed(2)}，支出¥${totals.expense.toFixed(2)}`);
+    }
 
     // 如果设置了全局密码，自动加密笔记
     if (AppState.globalPasswordHash) {
       newNote.is_encrypted = true;
+      // 实际加密内容（使用 CryptoHelper）
       try {
-        // 如果内存中没有密码，先提示用户输入
-        if (!AppState.tempPassword) {
-          const password = await showPasswordDialog('请输入全局密码以加密笔记', '密码验证');
-          if (!password) {
-            showToast('需要密码才能加密笔记', 'error');
-            newNote.is_encrypted = false;
-          } else {
-            const hash = await CryptoHelper.hashPassword(password);
-            if (hash !== AppState.globalPasswordHash) {
-              showToast('密码错误', 'error');
-              newNote.is_encrypted = false;
-            } else {
-              AppState.tempPassword = password;
-            }
-          }
-        }
-        if (AppState.tempPassword) {
-          const encrypted = await CryptoHelper.encrypt(content, AppState.tempPassword);
-          if (encrypted) {
-            newNote.content = encrypted;
-          } else {
-            newNote.is_encrypted = false;
-          }
+        const encrypted = await CryptoHelper.encrypt(content, AppState.tempPassword || 'default');
+        if (encrypted) {
+          newNote.content = encrypted;
         }
       } catch (e) {
         console.warn('自动加密失败:', e);
-        newNote.is_encrypted = false;
       }
     }
   }
 
   Storage.set(Storage.keys.notes, notes);
-
-  // === 自动记账（新建和编辑都触发）===
-  if (noteId && content) {
-    const accountItems = extractAmountsFromText(content);
-    if (accountItems.length > 0) {
-      const totals = calculateTotalAmounts(accountItems);
-      const accounts = Storage.get(Storage.keys.accounts);
-      // 先删除旧的关联记账（避免重复）
-      const filteredAccounts = accounts.filter(a => a.noteId !== noteId);
-      filteredAccounts.push({
-        id: generateId(),
-        type: totals.income > totals.expense ? 'income' : 'expense',
-        amount: Math.max(totals.income, totals.expense) || (totals.income + totals.expense) / 2,
-        category: '笔记记账',
-        date: now.split('T')[0],
-        remark: `${title}：${accountItems.map(i => i.description).join('，')}`,
-        noteId: noteId,
-        created_at: now
-      });
-      Storage.set(Storage.keys.accounts, filteredAccounts);
-      showToast(`已自动记账：收入¥${totals.income.toFixed(2)}，支出¥${totals.expense.toFixed(2)}`);
-    }
-  }
 
   // 如果有 WebDAV，自动同步
   if (Storage.webdav && !AppState.syncInProgress) {
@@ -2942,24 +2825,20 @@ function deleteCurrentNote() {
 function deleteNoteById(noteId) {
   showConfirmDialog('确定要删除这个笔记吗？删除后可在回收站恢复。').then(confirmed => {
     if (!confirmed) return;
-    verifyPasswordIfNeeded('删除笔记').then(passed => {
-      if (!passed) return;
-      
-      const notes = Storage.get(Storage.keys.notes);
-      const note = notes.find(n => String(n.id) === String(noteId));
-      
-      if (note) {
-        note.deleted = 1;
-        note.updated_at = new Date().toISOString();
-        Storage.set(Storage.keys.notes, notes);
-        
-        if (AppState.editingNoteId === noteId) {
-          closeNoteEditor();
-        }
-        renderNotes();
-        showToast('已删除，可在回收站恢复');
+    const notes = Storage.get(Storage.keys.notes);
+    const note = notes.find(n => String(n.id) === String(noteId));
+
+    if (note) {
+      note.deleted = 1;
+      note.updated_at = new Date().toISOString();
+      Storage.set(Storage.keys.notes, notes);
+
+      if (AppState.editingNoteId === noteId) {
+        closeNoteEditor();
       }
-    });
+      renderNotes();
+      showToast('已删除，可在回收站恢复');
+    }
   });
 }
 
@@ -3001,35 +2880,22 @@ function updatePinButton(note) {
 }
 
 function updateEncryptButton(note) {
-  if (!note) return;
-  if (note.is_encrypted) {
-    // 加密状态：显示解密按钮，隐藏编辑按钮
-    DOM.decryptNoteBtn.style.display = 'inline-block';
-    DOM.toggleEditBtn.style.display = 'none';
-  } else {
-    // 未加密状态：隐藏解密按钮，显示编辑按钮
-    DOM.decryptNoteBtn.style.display = 'none';
-    DOM.toggleEditBtn.style.display = 'inline-block';
-  }
+  // 加密按钮已移除，此函数保留用于兼容，但不再操作UI
+  // 如果设置了全局密码，笔记会自动加密
 }
 
 async function toggleNoteEncrypt() {
   if (!AppState.editingNoteId) return;
   const notes = Storage.get(Storage.keys.notes);
-  const note = notes.find(n => String(n.id) === String(AppState.editingNoteId));
+  const note = notes.find(n => n.id === AppState.editingNoteId);
   if (!note) return;
 
   if (note.is_encrypted) {
     // 解密
-    const password = await showPasswordDialog('请输入解密密码', '解密笔记');
+    const password = prompt('请输入解密密码');
     if (!password) return;
     try {
-      console.log('[解密] 开始解密笔记, ID:', note.id);
-      console.log('[解密] 加密内容长度:', note.content ? note.content.length : 0);
       const decrypted = await CryptoHelper.decrypt(note.content, password);
-      console.log('[解密] 解密成功, 内容长度:', decrypted.length);
-      // 解密成功，保存密码到内存
-      AppState.tempPassword = password;
       note.content = decrypted;
       note.is_encrypted = false;
       note.is_protected = false;
@@ -3037,56 +2903,35 @@ async function toggleNoteEncrypt() {
       Storage.set(Storage.keys.notes, notes);
       DOM.noteEditor.value = decrypted;
       DOM.noteEditor.readOnly = true;
-      DOM.noteTitleInput.readOnly = true;
       DOM.toggleEditBtn.textContent = '✏️ 编辑';
       updateEncryptButton(note);
       showToast('笔记已解密');
     } catch (e) {
-      console.error('[解密] 失败:', e);
-      // 尝试用 'default' 密码解密（向后兼容）
-      try {
-        console.log('[解密] 尝试用默认密码解密...');
-        const decrypted = await CryptoHelper.decrypt(note.content, 'default');
-        console.log('[解密] 使用默认密码解密成功！');
-        AppState.tempPassword = 'default';
-        note.content = decrypted;
-        note.is_encrypted = false;
-        note.is_protected = false;
-        note.updated_at = new Date().toISOString();
-        Storage.set(Storage.keys.notes, notes);
-        DOM.noteEditor.value = decrypted;
-        DOM.noteEditor.readOnly = true;
-        DOM.noteTitleInput.readOnly = true;
-        DOM.toggleEditBtn.textContent = '✏️ 编辑';
-        updateEncryptButton(note);
-        showToast('笔记已解密（使用默认密码）', 'warning');
-      } catch (e2) {
-        console.error('[解密] 默认密码也失败:', e2);
-        showToast('密码错误，无法解密', 'error');
-      }
+      showToast('密码错误，无法解密', 'error');
     }
   } else {
     // 加密
-    const password = await showPasswordDialog('请输入加密密码（需确认）', '加密笔记', true);
+    const password = prompt('请输入加密密码');
     if (!password) return;
+    const confirmPassword = prompt('请再次输入密码确认');
+    if (password !== confirmPassword) {
+      showToast('两次密码不一致', 'error');
+      return;
+    }
     try {
-      console.log('[加密] 开始加密笔记, ID:', note.id);
       const content = DOM.noteEditor.value;
       const encrypted = await CryptoHelper.encrypt(content, password);
-      console.log('[加密] 加密成功, 密文长度:', encrypted.length);
       note.content = encrypted;
       note.is_encrypted = true;
       note.is_protected = true;
       note.updated_at = new Date().toISOString();
       Storage.set(Storage.keys.notes, notes);
-      DOM.noteEditor.value = '🔒 此笔记已加密，点击上方「🔓 解密」按钮输入密码查看';
+      DOM.noteEditor.value = '🔒 此笔记已加密';
       DOM.noteEditor.readOnly = true;
-      DOM.noteTitleInput.readOnly = true;
       DOM.toggleEditBtn.textContent = '✏️ 编辑';
       updateEncryptButton(note);
       showToast('笔记已加密');
     } catch (e) {
-      console.error('[加密] 失败:', e);
       showToast('加密失败', 'error');
     }
   }
@@ -3478,24 +3323,10 @@ function switchToTodoView(todoId) {
 
 // 日历点击跳转：切换到笔记视图并打开对应笔记
 function switchToNotesView(noteId) {
-  // 先检查笔记是否存在且未删除
-  const notes = Storage.get(Storage.keys.notes);
-  const note = notes.find(n => String(n.id) === String(noteId));
-  
-  if (!note || note.deleted) {
-    showToast('该笔记已被删除', 'error');
-    return;
-  }
-  
-  // 密码验证
-  verifyPasswordIfNeeded('查看笔记').then(passed => {
-    if (!passed) return;
-    
-    switchView('notes');
-    setTimeout(() => {
-      openNoteEditor(noteId);
-    }, 100);
-  });
+  switchView('notes');
+  setTimeout(() => {
+    openNoteEditor(noteId);
+  }, 100);
 }
 
 // 日历点击跳转：切换到记账视图并筛选当天数据
@@ -3735,36 +3566,17 @@ function restoreTrashItem(id, type) {
 }
 
 function permanentDeleteTrashItem(id) {
-  // 先验证密码
-  verifyPasswordIfNeeded('彻底删除').then(async (confirmed) => {
+  showConfirmDialog('确定要彻底删除吗？此操作不可恢复！', '⚠️ 彻底删除').then(confirmed => {
     if (!confirmed) return;
-    
+    // 从 todos 和 notes 中彻底删除
     const todos = Storage.get(Storage.keys.todos);
     const notes = Storage.get(Storage.keys.notes);
-    const accounts = Storage.get(Storage.keys.accounts);
-    
-    // 找出要删除的笔记ID（可能是待办或笔记）
-    const isTodo = todos.find(t => String(t.id) === String(id) && t.deleted);
-    const isNote = notes.find(n => String(n.id) === String(id) && n.deleted);
-    
-    // 如果要删除的是笔记，删除关联的记账记录
-    let deletedAccountsCount = 0;
-    if (isNote) {
-      const filteredAccounts = accounts.filter(a => String(a.noteId) !== String(id));
-      deletedAccountsCount = accounts.length - filteredAccounts.length;
-      if (deletedAccountsCount > 0) {
-        Storage.set(Storage.keys.accounts, filteredAccounts);
-        console.log(`[彻底删除] 同时删除了 ${deletedAccountsCount} 条关联的记账记录`);
-      }
-    }
-    
-    // 彻底删除待办和笔记
     Storage.set(Storage.keys.todos, todos.filter(t => String(t.id) !== String(id)));
     Storage.set(Storage.keys.notes, notes.filter(n => String(n.id) !== String(id)));
     AppState.selectedDeletedTodos.delete(String(id));
     AppState.selectedDeletedNotes.delete(String(id));
     renderTrash();
-    showToast(deletedAccountsCount > 0 ? `已彻底删除（同时删除 ${deletedAccountsCount} 条关联记账）` : '已彻底删除');
+    showToast('已彻底删除');
   });
 }
 
@@ -3801,33 +3613,19 @@ function batchPermanentlyDeleteTrash() {
   const total = todoIds.length + noteIds.length;
   if (total === 0) return;
 
-  // 先验证密码
-  verifyPasswordIfNeeded('彻底删除').then(async (confirmed) => {
+  showConfirmDialog(`确定要彻底删除选中的 ${total} 个项目吗？此操作不可恢复！`, '⚠️ 彻底删除').then(confirmed => {
     if (!confirmed) return;
-    
     const todos = Storage.get(Storage.keys.todos);
     const notes = Storage.get(Storage.keys.notes);
-    const accounts = Storage.get(Storage.keys.accounts);
 
     const deleteIds = new Set([...todoIds, ...noteIds].map(id => String(id)));
-    
-    // 删除关联的记账记录
-    const accountsToDelete = accounts.filter(a => a.noteId && deleteIds.has(String(a.noteId)));
-    const filteredAccounts = accounts.filter(a => !a.noteId || !deleteIds.has(String(a.noteId)));
-    
-    if (accountsToDelete.length > 0) {
-      Storage.set(Storage.keys.accounts, filteredAccounts);
-      console.log(`[彻底删除] 同时删除了 ${accountsToDelete.length} 条关联的记账记录`);
-    }
-    
-    // 彻底删除待办和笔记
     Storage.set(Storage.keys.todos, todos.filter(t => !deleteIds.has(String(t.id))));
     Storage.set(Storage.keys.notes, notes.filter(n => !deleteIds.has(String(n.id))));
 
     AppState.selectedDeletedTodos.clear();
     AppState.selectedDeletedNotes.clear();
     renderTrash();
-    showToast(`已彻底删除（同时删除 ${accountsToDelete.length} 条关联记账）`);
+    showToast('已彻底删除');
   });
 }
 
@@ -3843,30 +3641,14 @@ function emptyTrash() {
     return;
   }
 
-  // 先验证密码
-  verifyPasswordIfNeeded('清空回收站').then(async (confirmed) => {
+  showConfirmDialog(`确定要清空回收站吗？共 ${total} 个项目，此操作不可恢复！`, '⚠️ 清空回收站').then(confirmed => {
     if (!confirmed) return;
-    
-    // 获取要删除的笔记ID列表
-    const deletedNoteIds = deletedNotes.map(n => String(n.id));
-    
-    // 删除关联的记账记录
-    const accounts = Storage.get(Storage.keys.accounts);
-    const accountsToDelete = accounts.filter(a => a.noteId && deletedNoteIds.includes(String(a.noteId)));
-    const filteredAccounts = accounts.filter(a => !a.noteId || !deletedNoteIds.includes(String(a.noteId)));
-    
-    if (accountsToDelete.length > 0) {
-      Storage.set(Storage.keys.accounts, filteredAccounts);
-      console.log(`[清空回收站] 同时删除了 ${accountsToDelete.length} 条关联的记账记录`);
-    }
-    
-    // 清空回收站
     Storage.set(Storage.keys.todos, todos.filter(t => !t.deleted));
     Storage.set(Storage.keys.notes, notes.filter(n => !n.deleted));
     AppState.selectedDeletedTodos.clear();
     AppState.selectedDeletedNotes.clear();
     renderTrash();
-    showToast(`回收站已清空（同时删除 ${accountsToDelete.length} 条关联记账）`);
+    showToast('回收站已清空');
   });
 }
 
@@ -3963,23 +3745,16 @@ function renderAccounts() {
     `;
 
     dayRecords.forEach(a => {
-      const isFromNote = a.noteId;
-      const noteHint = isFromNote ? '📝 笔记记账' : a.category;
       html += `
-        <li class="account-item ${isFromNote ? 'from-note' : ''}" data-account-id="${a.id}" data-note-id="${isFromNote || ''}" style="padding: 12px 15px; border-bottom: 1px solid #eee; display: flex; justify-content: space-between; align-items: center; ${isFromNote ? 'cursor:pointer;' : ''}">
+        <li class="account-item" style="padding: 12px 15px; border-bottom: 1px solid #eee; display: flex; justify-content: space-between; align-items: center;">
           <div style="display: flex; align-items: center; gap: 10px; flex: 1;">
-            <span style="font-size: 0.9rem; color: #666;">${escapeHtml(noteHint)}</span>
+            <span style="font-size: 0.9rem; color: #666;">${a.category}</span>
             <span style="font-size: 0.85rem; color: #999;">${escapeHtml(a.remark || '')}</span>
-            ${isFromNote ? '<span style="font-size:0.75rem;color:#2d6a4f;">📖 点击查看笔记</span>' : ''}
           </div>
           <div style="display: flex; align-items: center; gap: 10px;">
             <span style="font-weight: 600; color: ${a.type === 'income' ? '#27ae60' : '#e74c3c'}; font-size: 14px;">${a.type === 'income' ? '+' : '-'}¥${a.amount.toFixed(2)}</span>
-            ${!isFromNote ? `
-              <button class="btn btn-outline btn-sm edit-account-btn" data-id="${a.id}" style="padding:4px 10px;font-size:12px;">编辑</button>
-              <button class="btn btn-danger btn-sm delete-account-btn" data-id="${a.id}" style="padding:4px 10px;font-size:12px;">删除</button>
-            ` : `
-              <button class="btn btn-danger btn-sm delete-account-btn" data-id="${a.id}" style="padding:4px 10px;font-size:12px;">删除</button>
-            `}
+            <button class="btn btn-outline btn-sm" onclick="editAccount('${a.id}')" style="padding:4px 10px;font-size:12px;">编辑</button>
+            <button class="btn btn-danger btn-sm" onclick="deleteAccount('${a.id}')" style="padding:4px 10px;font-size:12px;">删除</button>
           </div>
         </li>
       `;
@@ -4002,39 +3777,6 @@ function renderAccounts() {
         itemsContainer.style.display = isExpanded ? 'none' : 'block';
         if (toggleIcon) toggleIcon.style.transform = isExpanded ? 'rotate(0deg)' : 'rotate(90deg)';
       }
-    });
-  });
-  
-  // 绑定从笔记导入的记账记录点击事件
-  document.querySelectorAll('.account-item.from-note').forEach(item => {
-    item.addEventListener('click', (e) => {
-      if (e.target.closest('button')) return; // 忽略按钮点击
-      const noteId = item.dataset.noteId;
-      if (noteId) {
-        verifyPasswordIfNeeded('查看笔记').then(passed => {
-          if (!passed) return;
-          switchView('notes');
-          setTimeout(() => openNoteEditor(noteId), 100);
-        });
-      }
-    });
-  });
-  
-  // 绑定编辑按钮
-  document.querySelectorAll('.edit-account-btn').forEach(btn => {
-    btn.addEventListener('click', (e) => {
-      e.stopPropagation();
-      const id = btn.dataset.id;
-      editAccount(id);
-    });
-  });
-  
-  // 绑定删除按钮
-  document.querySelectorAll('.delete-account-btn').forEach(btn => {
-    btn.addEventListener('click', (e) => {
-      e.stopPropagation();
-      const id = btn.dataset.id;
-      deleteAccount(id);
     });
   });
 }
@@ -4118,7 +3860,7 @@ function openAccountModal(accountId = null) {
 
   if (accountId) {
     const accounts = Storage.get(Storage.keys.accounts);
-    const account = accounts.find(a => String(a.id) === String(accountId));
+    const account = accounts.find(a => a.id === accountId);
     if (account) {
       DOM.accountType.value = account.type;
       DOM.accountAmount.value = account.amount;
@@ -4153,7 +3895,7 @@ async function saveAccount() {
   const now = new Date().toISOString();
 
   if (AppState.editingAccountId) {
-    const index = accounts.findIndex(a => String(a.id) === String(AppState.editingAccountId));
+    const index = accounts.findIndex(a => a.id === AppState.editingAccountId);
     if (index !== -1) {
       accounts[index] = {
         ...accounts[index],
@@ -4195,31 +3937,11 @@ function editAccount(id) {
 }
 
 function deleteAccount(id) {
-  verifyPasswordIfNeeded('删除记账').then(async (confirmed) => {
+  showConfirmDialog('确定要删除这条记录吗？').then(confirmed => {
     if (!confirmed) return;
-    
     const accounts = Storage.get(Storage.keys.accounts);
-    const account = accounts.find(a => String(a.id) === String(id));
-    
-    if (account && account.noteId) {
-      // 从笔记导入的记账，删除时同时询问是否也要删除对应笔记中的相关内容
-      showConfirmDialog('此记账记录关联笔记，是否同时删除对应笔记？').then(deleteNote => {
-        Storage.set(Storage.keys.accounts, accounts.filter(a => String(a.id) !== String(id)));
-        if (deleteNote) {
-          const notes = Storage.get(Storage.keys.notes);
-          const noteIndex = notes.findIndex(n => String(n.id) === String(account.noteId));
-          if (noteIndex !== -1) {
-            notes[noteIndex].deleted = 1;
-            notes[noteIndex].updated_at = new Date().toISOString();
-            Storage.set(Storage.keys.notes, notes);
-          }
-        }
-        renderAccounts();
-      });
-    } else {
-      Storage.set(Storage.keys.accounts, accounts.filter(a => String(a.id) !== String(id)));
-      renderAccounts();
-    }
+    Storage.set(Storage.keys.accounts, accounts.filter(a => a.id !== id));
+    renderAccounts();
   });
 }
 
@@ -4339,127 +4061,7 @@ function closeDataModal() {
   DOM.dataModal.style.display = 'none';
 }
 
-// ==================== 自动记账（从笔记内容识别金额）====================
-// 从文本中提取金额和收支类型
-function extractAmountsFromText(text) {
-  if (!text) return [];
-  const items = [];
-
-  // 收入关键词
-  const incomeKeywords = ['收入', '工资', '奖金', '到账', '收款', '收到', '转账', '佣金', '报销', '红包', '兼职', '营收', '盈利', '补贴', '退款', '利息', '分红', '提成'];
-  // 支出关键词
-  const expenseKeywords = ['消费', '支出', '花了', '支付', '付款', '买', '购物', '餐饮', '交通', '娱乐', '学费', '话费', '电费', '水费', '房租', '物业', '医药', '零食', '充值', '扣款'];
-
-  // 金额正则：匹配 100元、100.5元、¥100、100块、100块钱、100.5块
-  const amountRegex = /(\d+\.?\d*)\s*(元|块|块钱|¥|￥)/g;
-
-  // 按行分割，逐行检测
-  const lines = text.split(/[\n\r]+/);
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-
-    // 检测是否有金额
-    const amountMatch = trimmed.match(/(\d+\.?\d*)\s*(元|块|块钱|¥|￥)/);
-    if (!amountMatch) continue;
-
-    const amount = parseFloat(amountMatch[1]);
-    if (isNaN(amount) || amount <= 0) continue;
-
-    // 判断类型：优先看关键词，默认支出
-    let type = 'expense';
-    for (const kw of incomeKeywords) {
-      if (trimmed.includes(kw)) {
-        type = 'income';
-        break;
-      }
-    }
-    // 如果没找到收入关键词，再检查支出关键词（可选）
-    // 默认就是 expense，所以不需要额外处理
-
-    items.push({
-      amount,
-      type,
-      description: trimmed.substring(0, 50)
-    });
-  }
-
-  return items;
-}
-
-// 计算提取金额的总收入/总支出
-function calculateTotalAmounts(items) {
-  let income = 0, expense = 0;
-  items.forEach(item => {
-    if (item.type === 'income') income += item.amount;
-    else expense += item.amount;
-  });
-  return { income, expense };
-}
-
 // ==================== 工具函数 ====================
-// 显示密码验证弹窗
-function verifyPasswordIfNeeded(actionName = '删除') {
-  return new Promise((resolve) => {
-    if (!AppState.globalPasswordHash) {
-      resolve(true);
-      return;
-    }
-    
-    const modal = document.createElement('div');
-    modal.className = 'modal';
-    modal.style.cssText = 'display:flex;align-items:center;justify-content:center;';
-    modal.innerHTML = `
-      <div class="modal-content" style="max-width:320px;">
-        <h3>🔐 密码验证</h3>
-        <p style="margin:12px 0;color:#666;font-size:0.9rem;">${actionName}操作需要验证密码</p>
-        <input type="password" id="verifyPasswordInput" class="form-input" placeholder="输入密码" style="width:100%;padding:10px;border:1px solid #ddd;border-radius:6px;margin-bottom:16px;">
-        <div style="display:flex;gap:10px;">
-          <button class="btn btn-secondary" id="cancelVerifyBtn" style="flex:1;">取消</button>
-          <button class="btn btn-primary" id="confirmVerifyBtn" style="flex:1;">确认</button>
-        </div>
-      </div>
-    `;
-    document.body.appendChild(modal);
-    
-    const input = modal.querySelector('#verifyPasswordInput');
-    const confirmBtn = modal.querySelector('#confirmVerifyBtn');
-    const cancelBtn = modal.querySelector('#cancelVerifyBtn');
-    
-    input.focus();
-    
-    const cleanup = () => {
-      if (modal.parentNode) modal.remove();
-    };
-    
-    confirmBtn.addEventListener('click', async () => {
-      const password = input.value;
-      if (!password) {
-        showToast('请输入密码', 'error');
-        return;
-      }
-      const hash = await CryptoHelper.hashPassword(password);
-      if (hash !== AppState.globalPasswordHash) {
-        showToast('密码错误', 'error');
-        input.value = '';
-        input.focus();
-        return;
-      }
-      cleanup();
-      resolve(true);
-    });
-    
-    cancelBtn.addEventListener('click', () => {
-      cleanup();
-      resolve(false);
-    });
-    
-    input.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') confirmBtn.click();
-      else if (e.key === 'Escape') cancelBtn.click();
-    });
-  });
-}
 function generateId() {
   return Date.now() + Math.floor(Math.random() * 1000);
 }

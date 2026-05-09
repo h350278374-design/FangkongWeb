@@ -708,3 +708,17 @@ body {
   50% { background-color: #fff3cd; }
   100% { background-color: transparent; }
 }
+
+/* 从笔记导入的记账记录样式 */
+.account-item.from-note {
+  background: #f0faf4;
+  border-left: 3px solid var(--primary-green);
+}
+
+.account-item.from-note:hover {
+  background: #e0f5eb;
+}
+
+.account-day-group:has(.from-note) {
+  border-left: 3px solid var(--primary-green);
+}
